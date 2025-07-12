@@ -1,7 +1,7 @@
 {
     "name": "Go Example",
     "image": "mcr.microsoft.com/devcontainers/go:0-1.20-bullseye",
-    "forwardPorts": [4000],
+    "forwardPorts": [11470, 12471],
     "customizations": {
       "devpod": {
         "prebuildRepository": "ghcr.io/loft-sh/devpod-example-go"
