@@ -18,35 +18,127 @@ This is a Go rewrite of the original Node.js Stremio server, providing the same 
 ## API Endpoints
 
 ### Torrent Management
-- `POST /api/create` - Create a new torrent from magnet URI
-- `GET /api/list` - List all active torrents
-- `GET /api/stats/{infoHash}` - Get torrent statistics
-- `DELETE /api/remove/{infoHash}` - Remove a torrent
+- `POST /{infoHash}/create` - Create a new torrent with infoHash in URL path and custom configuration
+- `GET /list` - List all active torrents
+- `GET /stats/{infoHash}` - Get torrent statistics
+- `GET /stats/{infoHash}/{fileIndex}/stats.json` - Get detailed file statistics
+- `DELETE /remove/{infoHash}` - Remove a torrent
+
+### Creating a Torrent with Custom Configuration
+
+The `/create` and `/{infoHash}/create` endpoints accept a JSON payload with torrent information, peer search configuration, and tracker sources:
+
+#### Original `/create` endpoint:
+```json
+{
+  "torrent": {
+    "infoHash": "04b4000d88481e39b1fa486d064262ba9b7cbe8a"
+  },
+  "peerSearch": {
+    "sources": [
+      "dht:04b4000d88481e39b1fa486d064262ba9b7cbe8a",
+      "tracker:udp://tracker.opentrackr.org:1337/announce",
+      "tracker:udp://open.tracker.cl:1337/announce",
+      "tracker:udp://open.demonii.com:1337/announce"
+    ],
+    "min": 40,
+    "max": 200
+  },
+  "guessFileIdx": {}
+}
+```
+
+#### New `/{infoHash}/create` endpoint:
+```json
+{
+  "torrent": {
+    "infoHash": "b081ff8cd259906524817b21e2476ee83e37a4aa"
+  },
+  "peerSearch": {
+    "sources": [
+      "dht:b081ff8cd259906524817b21e2476ee83e37a4aa",
+      "tracker:udp://tracker.opentrackr.org:1337/announce"
+    ],
+    "min": 40,
+    "max": 200
+  },
+  "guessFileIdx": {}
+}
+```
+
+**Parameters:**
+- `torrent.infoHash`: The SHA1 hash of the torrent (required for `/create`, optional for `/{infoHash}/create`)
+- `peerSearch.sources`: Array of peer discovery sources
+  - `dht:{infoHash}`: Enable DHT for the specific torrent
+  - `tracker:{url}`: Add tracker URL for peer discovery
+- `peerSearch.min`: Minimum number of peers to maintain
+- `peerSearch.max`: Maximum number of peers to connect to
+- `guessFileIdx`: Reserved for future use
+
+**Examples:**
+
+**Original endpoint:**
+```bash
+curl -X POST http://localhost:11470/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "torrent": {
+      "infoHash": "04b4000d88481e39b1fa486d064262ba9b7cbe8a"
+    },
+    "peerSearch": {
+      "sources": [
+        "dht:04b4000d88481e39b1fa486d064262ba9b7cbe8a",
+        "tracker:udp://tracker.opentrackr.org:1337/announce"
+      ],
+      "min": 40,
+      "max": 200
+    },
+    "guessFileIdx": {}
+  }'
+```
+
+**New endpoint with infoHash in URL:**
+```bash
+curl -X POST http://localhost:11470/b081ff8cd259906524817b21e2476ee83e37a4aa/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "torrent": {},
+    "peerSearch": {
+      "sources": [
+        "dht:b081ff8cd259906524817b21e2476ee83e37a4aa",
+        "tracker:udp://tracker.opentrackr.org:1337/announce"
+      ],
+      "min": 40,
+      "max": 200
+    },
+    "guessFileIdx": {}
+  }'
+```
 
 ### Streaming
-- `GET /api/stream/{infoHash}/{fileIndex}` - Stream a torrent file
+- `GET /stream/{infoHash}/{fileIndex}` - Stream a torrent file
 - `GET /hlsv2/{infoHash}/{fileIndex}/master.m3u8` - HLS master playlist
 - `GET /hlsv2/{infoHash}/{fileIndex}/stream.m3u8` - HLS stream playlist
 - `GET /hlsv2/{infoHash}/{fileIndex}/stream-{quality}.m3u8` - HLS quality-specific playlist
 - `GET /hlsv2/{infoHash}/{fileIndex}/stream-{quality}/{segment}.ts` - HLS segment
 
 ### FFmpeg Operations
-- `GET /api/hwaccel-profiler` - Hardware acceleration information
-- `POST /api/transcode` - Video transcoding
-- `GET /api/probe` - Video information and metadata
-- `GET /api/thumb.jpg` - Generate video thumbnails
+- `GET /hwaccel-profiler` - Hardware acceleration information
+- `POST /transcode` - Video transcoding
+- `GET /probe` - Video information and metadata
+- `GET /thumb.jpg` - Generate video thumbnails
 
 ### Server Information
-- `GET /api/status` - Server status and uptime
-- `GET /api/network-info` - Network information
-- `GET /api/device-info` - Device information
-- `GET /api/settings` - Server settings
+- `GET /status` - Server status and uptime
+- `GET /network-info` - Network information
+- `GET /device-info` - Device information
+- `GET /settings` - Server settings
 
 ### Other
-- `GET /api/proxy` - HTTP proxy
-- `GET /api/subtitles` - Subtitle handling
-- `GET /api/casting` - Casting support
-- `GET /api/local-addon` - Local addon support
+- `GET /proxy` - HTTP proxy
+- `GET /subtitles` - Subtitle handling
+- `GET /casting` - Casting support
+- `GET /local-addon` - Local addon support
 - `GET /ws` - WebSocket endpoint
 
 ## Environment Variables
@@ -59,6 +151,7 @@ This is a Go rewrite of the original Node.js Stremio server, providing the same 
 | `NO_CORS` | false | Disable CORS headers |
 | `USERNAME` | - | Basic auth username |
 | `PASSWORD` | - | Basic auth password |
+| `LOG_LEVEL` | info | Logging level (info, warn, error) |
 
 ### FFmpeg Configuration
 | Variable | Default | Description |
@@ -112,7 +205,7 @@ docker run -d \
 
 ### Creating a Torrent
 ```bash
-curl -X POST http://localhost:11470/api/create \
+curl -X POST http://localhost:11470/create \
   -H "Content-Type: application/json" \
   -d '{"magnetURI": "magnet:?xt=urn:btih:..."}'
 ```
@@ -120,24 +213,29 @@ curl -X POST http://localhost:11470/api/create \
 ### Streaming a File
 ```bash
 curl -H "Range: bytes=0-1048575" \
-  http://localhost:11470/api/stream/{infoHash}/0
+  http://localhost:11470/stream/{infoHash}/0
 ```
 
 ### Getting Torrent Stats
 ```bash
-curl http://localhost:11470/api/stats/{infoHash}
+curl http://localhost:11470/stats/{infoHash}
+```
+
+### Getting File Stats
+```bash
+curl http://localhost:11470/stats/{infoHash}/0/stats.json
 ```
 
 ### FFmpeg Operations
 
 #### Hardware Acceleration Info
 ```bash
-curl http://localhost:11470/api/hwaccel-profiler
+curl http://localhost:11470/hwaccel-profiler
 ```
 
 #### Video Transcoding
 ```bash
-curl -X POST http://localhost:11470/api/transcode \
+curl -X POST http://localhost:11470/transcode \
   -H "Content-Type: application/json" \
   -d '{
     "inputPath": "/path/to/input.mp4",
@@ -156,12 +254,77 @@ curl -X POST http://localhost:11470/api/transcode \
 
 #### Video Probing
 ```bash
-curl "http://localhost:11470/api/probe?path=/path/to/video.mp4"
+curl "http://localhost:11470/probe?path=/path/to/video.mp4"
+```
+
+The probe endpoint returns detailed media information in the following format:
+```json
+{
+    "format": {
+        "name": "matroska,webm",
+        "duration": 1386.144
+    },
+    "streams": [
+        {
+            "id": 0,
+            "index": 0,
+            "track": "video",
+            "codec": "hevc",
+            "streamBitRate": 0,
+            "streamMaxBitRate": 0,
+            "startTime": 0,
+            "startTimeTs": 0,
+            "timescale": 1000,
+            "width": 1280,
+            "height": 720,
+            "frameRate": 23.976023976023978,
+            "numberOfFrames": null,
+            "isHdr": false,
+            "isDoVi": false,
+            "hasBFrames": true,
+            "formatBitRate": 1097224,
+            "formatMaxBitRate": 0,
+            "bps": 5589998,
+            "numberOfBytes": 968532259,
+            "formatDuration": 1386.144
+        },
+        {
+            "id": 0,
+            "index": 1,
+            "track": "audio",
+            "codec": "eac3",
+            "streamBitRate": 256000,
+            "streamMaxBitRate": 0,
+            "startTime": 0,
+            "startTimeTs": 0,
+            "timescale": 1000,
+            "sampleRate": 48000,
+            "channels": 6,
+            "channelLayout": "5.1(side)",
+            "title": null,
+            "language": "eng"
+        },
+        {
+            "id": 0,
+            "index": 2,
+            "track": "subtitle",
+            "codec": "ass",
+            "streamBitRate": 0,
+            "streamMaxBitRate": 0,
+            "startTime": 0,
+            "startTimeTs": 0,
+            "timescale": 1000,
+            "title": "English [SDH]",
+            "language": "eng"
+        }
+    ],
+    "samples": {}
+}
 ```
 
 #### Thumbnail Generation
 ```bash
-curl "http://localhost:11470/api/thumb.jpg?path=/path/to/video.mp4&time=10.5"
+curl "http://localhost:11470/thumb.jpg?path=/path/to/video.mp4&time=10.5"
 ```
 
 ## Performance Benefits
@@ -214,7 +377,7 @@ services:
 
 ### Checking Hardware Acceleration
 ```bash
-curl http://localhost:11470/api/hwaccel-profiler
+curl http://localhost:11470/hwaccel-profiler
 ```
 
 This will return information about available hardware acceleration methods.

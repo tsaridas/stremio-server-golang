@@ -5,7 +5,6 @@ go 1.20
 require (
 	github.com/anacrolix/torrent v1.52.6
 	github.com/gorilla/mux v1.8.1
-	github.com/rs/cors v1.10.1
 	golang.org/x/net v0.19.0
 )
 

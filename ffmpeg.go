@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,135 +39,229 @@ type FFmpegConfig struct {
 
 // VideoInfo contains video metadata
 type VideoInfo struct {
-	Duration    float64            `json:"duration"`
-	Width       int                `json:"width"`
-	Height      int                `json:"height"`
-	BitRate     int                `json:"bit_rate"`
-	CodecName   string             `json:"codec_name"`
-	CodecType   string             `json:"codec_type"`
-	Streams     []StreamInfo       `json:"streams"`
-	Format      FormatInfo         `json:"format"`
+	Duration  float64      `json:"duration"`
+	Width     int          `json:"width"`
+	Height    int          `json:"height"`
+	BitRate   int          `json:"bit_rate"`
+	CodecName string       `json:"codec_name"`
+	CodecType string       `json:"codec_type"`
+	Streams   []StreamInfo `json:"streams"`
+	Format    FormatInfo   `json:"format"`
 }
 
 // StreamInfo contains stream information
 type StreamInfo struct {
-	Index       int     `json:"index"`
-	CodecName   string  `json:"codec_name"`
-	CodecType   string  `json:"codec_type"`
-	Width       int     `json:"width,omitempty"`
-	Height      int     `json:"height,omitempty"`
-	BitRate     int     `json:"bit_rate,omitempty"`
-	Duration    float64 `json:"duration,omitempty"`
-	SampleRate  int     `json:"sample_rate,omitempty"`
-	Channels    int     `json:"channels,omitempty"`
-	Language    string  `json:"language,omitempty"`
-	Title       string  `json:"title,omitempty"`
+	Index      int     `json:"index"`
+	CodecName  string  `json:"codec_name"`
+	CodecType  string  `json:"codec_type"`
+	Width      int     `json:"width,omitempty"`
+	Height     int     `json:"height,omitempty"`
+	BitRate    int     `json:"bit_rate,omitempty"`
+	Duration   float64 `json:"duration,omitempty"`
+	SampleRate int     `json:"sample_rate,omitempty"`
+	Channels   int     `json:"channels,omitempty"`
+	Language   string  `json:"language,omitempty"`
+	Title      string  `json:"title,omitempty"`
 }
 
 // FormatInfo contains format information
 type FormatInfo struct {
-	Duration    float64 `json:"duration"`
-	BitRate     int     `json:"bit_rate"`
-	Size        int64   `json:"size"`
+	Duration float64 `json:"duration"`
+	BitRate  int     `json:"bit_rate"`
+	Size     int64   `json:"size"`
 }
 
 // TranscodeJob represents a transcoding job
 type TranscodeJob struct {
-	ID          string
-	InputPath   string
-	OutputPath  string
-	Options     TranscodeOptions
-	Status      string
-	Progress    float64
-	Error       error
-	StartTime   time.Time
-	EndTime     time.Time
-	mu          sync.RWMutex
+	ID         string
+	InputPath  string
+	OutputPath string
+	Options    TranscodeOptions
+	Status     string
+	Progress   float64
+	Error      error
+	StartTime  time.Time
+	EndTime    time.Time
+	mu         sync.RWMutex
 }
 
 // TranscodeOptions holds transcoding parameters
 type TranscodeOptions struct {
-	VideoCodec     string
-	AudioCodec     string
-	VideoBitRate   int
-	AudioBitRate   int
-	Width          int
-	Height         int
-	FrameRate      int
-	Quality        int
-	HardwareAccel  bool
+	VideoCodec      string
+	AudioCodec      string
+	VideoBitRate    int
+	AudioBitRate    int
+	Width           int
+	Height          int
+	FrameRate       int
+	Quality         int
+	HardwareAccel   bool
 	SegmentDuration int
-	OutputFormat   string
+	OutputFormat    string
 }
 
-// NewFFmpegManager creates a new FFmpeg manager
+// ProbeResponse represents the expected JSON response format for /probe
+type ProbeResponse struct {
+	Format  ProbeFormat            `json:"format"`
+	Streams []ProbeStream          `json:"streams"`
+	Samples map[string]interface{} `json:"samples"`
+}
+
+// ProbeFormat represents format information in the probe response
+type ProbeFormat struct {
+	Name     string  `json:"name"`
+	Duration float64 `json:"duration"`
+}
+
+// ProbeStream represents stream information in the probe response
+type ProbeStream struct {
+	ID               int     `json:"id"`
+	Index            int     `json:"index"`
+	Track            string  `json:"track"`
+	Codec            string  `json:"codec"`
+	StreamBitRate    int     `json:"streamBitRate"`
+	StreamMaxBitRate int     `json:"streamMaxBitRate"`
+	StartTime        int     `json:"startTime"`
+	StartTimeTs      int     `json:"startTimeTs"`
+	Timescale        int     `json:"timescale"`
+	Width            int     `json:"width,omitempty"`
+	Height           int     `json:"height,omitempty"`
+	FrameRate        float64 `json:"frameRate,omitempty"`
+	NumberOfFrames   *int    `json:"numberOfFrames,omitempty"`
+	IsHdr            bool    `json:"isHdr,omitempty"`
+	IsDoVi           bool    `json:"isDoVi,omitempty"`
+	HasBFrames       bool    `json:"hasBFrames,omitempty"`
+	FormatBitRate    int     `json:"formatBitRate,omitempty"`
+	FormatMaxBitRate int     `json:"formatMaxBitRate,omitempty"`
+	Bps              int     `json:"bps,omitempty"`
+	NumberOfBytes    int64   `json:"numberOfBytes,omitempty"`
+	FormatDuration   float64 `json:"formatDuration,omitempty"`
+	SampleRate       int     `json:"sampleRate,omitempty"`
+	Channels         int     `json:"channels,omitempty"`
+	ChannelLayout    string  `json:"channelLayout,omitempty"`
+	Title            *string `json:"title,omitempty"`
+	Language         string  `json:"language,omitempty"`
+}
+
+// NewFFmpegManager creates a new FFmpeg manager (matching Node.js server.js behavior)
 func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 	ffmpegPath, err := findFFmpeg()
 	if err != nil {
-		return nil, fmt.Errorf("ffmpeg not found: %v", err)
+		log.Printf("Warning: FFmpeg not found: %v", err)
+		// Return a manager with empty paths - server can still run without FFmpeg
+		return &FFmpegManager{
+			ffmpegPath:  "",
+			ffprobePath: "",
+			config:      config,
+		}, nil
 	}
-	
+
 	ffprobePath, err := findFFprobe()
 	if err != nil {
-		return nil, fmt.Errorf("ffprobe not found: %v", err)
+		log.Printf("Warning: FFprobe not found: %v", err)
+		// Return a manager with just ffmpeg - some operations will still work
+		return &FFmpegManager{
+			ffmpegPath:  ffmpegPath,
+			ffprobePath: "",
+			config:      config,
+		}, nil
 	}
-	
+
 	manager := &FFmpegManager{
 		ffmpegPath:  ffmpegPath,
 		ffprobePath: ffprobePath,
 		config:      config,
 	}
-	
-	// Test FFmpeg installation
+
+	// Test FFmpeg installation (but don't fail if it doesn't work)
 	if err := manager.testInstallation(); err != nil {
-		return nil, fmt.Errorf("ffmpeg test failed: %v", err)
+		log.Printf("Warning: FFmpeg test failed: %v", err)
+		// Still return the manager - server can run without working FFmpeg
 	}
-	
+
 	log.Printf("FFmpeg initialized: %s, FFprobe: %s", ffmpegPath, ffprobePath)
 	return manager, nil
 }
 
-// findFFmpeg locates the FFmpeg executable
+// findFFmpeg locates the FFmpeg executable (matching Node.js server.js logic)
 func findFFmpeg() (string, error) {
-	paths := []string{
-		os.Getenv("FFMPEG_BIN") + "/ffmpeg",
-		"/usr/lib/jellyfin-ffmpeg/ffmpeg",
-		"/usr/bin/ffmpeg",
-		"/usr/local/bin/ffmpeg",
-		"ffmpeg", // Try PATH
+	// Get executable directory
+	execPath, err := os.Executable()
+	execDir := ""
+	if err == nil {
+		execDir = filepath.Dir(execPath)
 	}
-	
+
+	// Paths matching Node.js server.js exactly
+	paths := []string{
+		os.Getenv("FFMPEG_BIN"),                     // Environment variable
+		filepath.Join(execDir, "ffmpeg"),            // Same directory as executable
+		filepath.Join(execDir, "ffmpeg.exe"),        // Windows executable
+		filepath.Join(execDir, "bin", "ffmpeg.exe"), // Windows bin directory
+		"/usr/lib/jellyfin-ffmpeg/ffmpeg",           // Jellyfin FFmpeg
+		"/usr/bin/ffmpeg",                           // System FFmpeg
+		"/usr/local/bin/ffmpeg",                     // Local FFmpeg
+		"ffmpeg",                                    // Try PATH
+	}
+
 	for _, path := range paths {
 		if path == "" {
 			continue
 		}
-		if _, err := os.Stat(path); err == nil {
+
+		// Check if file exists and is executable
+		if stat, err := os.Stat(path); err == nil {
+			// On Unix systems, check if it's executable
+			if runtime.GOOS != "windows" {
+				if stat.Mode()&0111 == 0 {
+					continue // Not executable
+				}
+			}
 			return path, nil
 		}
 	}
-	
+
 	return "", fmt.Errorf("ffmpeg not found in any of the expected locations")
 }
 
-// findFFprobe locates the FFprobe executable
+// findFFprobe locates the FFprobe executable (matching Node.js server.js logic)
 func findFFprobe() (string, error) {
-	paths := []string{
-		os.Getenv("FFPROBE_BIN") + "/ffprobe",
-		"/usr/lib/jellyfin-ffmpeg/ffprobe",
-		"/usr/bin/ffprobe",
-		"/usr/local/bin/ffprobe",
-		"ffprobe", // Try PATH
+	// Get executable directory
+	execPath, err := os.Executable()
+	execDir := ""
+	if err == nil {
+		execDir = filepath.Dir(execPath)
 	}
-	
+
+	// Paths matching Node.js server.js exactly
+	paths := []string{
+		os.Getenv("FFPROBE_BIN"),                     // Environment variable
+		filepath.Join(execDir, "ffprobe"),            // Same directory as executable
+		filepath.Join(execDir, "ffprobe.exe"),        // Windows executable
+		filepath.Join(execDir, "bin", "ffprobe.exe"), // Windows bin directory
+		"/usr/lib/jellyfin-ffmpeg/ffprobe",           // Jellyfin FFprobe
+		"/usr/bin/ffprobe",                           // System FFprobe
+		"/usr/local/bin/ffprobe",                     // Local FFprobe
+		"ffprobe",                                    // Try PATH
+	}
+
 	for _, path := range paths {
 		if path == "" {
 			continue
 		}
-		if _, err := os.Stat(path); err == nil {
+
+		// Check if file exists and is executable
+		if stat, err := os.Stat(path); err == nil {
+			// On Unix systems, check if it's executable
+			if runtime.GOOS != "windows" {
+				if stat.Mode()&0111 == 0 {
+					continue // Not executable
+				}
+			}
 			return path, nil
 		}
 	}
-	
+
 	return "", fmt.Errorf("ffprobe not found in any of the expected locations")
 }
 
@@ -175,12 +271,12 @@ func (fm *FFmpegManager) testInstallation() error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ffmpeg test failed: %v", err)
 	}
-	
+
 	cmd = exec.Command(fm.ffprobePath, "-version")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ffprobe test failed: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -193,32 +289,32 @@ func (fm *FFmpegManager) GetVideoInfo(inputPath string) (*VideoInfo, error) {
 		"-show_streams",
 		inputPath,
 	}
-	
+
 	cmd := exec.Command(fm.ffprobePath, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe failed: %v", err)
 	}
-	
+
 	var videoInfo VideoInfo
 	if err := json.Unmarshal(output, &videoInfo); err != nil {
 		return nil, fmt.Errorf("failed to parse ffprobe output: %v", err)
 	}
-	
+
 	return &videoInfo, nil
 }
 
 // TranscodeVideo transcodes a video file
 func (fm *FFmpegManager) TranscodeVideo(inputPath, outputPath string, options TranscodeOptions) error {
 	args := fm.buildTranscodeArgs(inputPath, outputPath, options)
-	
+
 	if fm.config.Debug {
 		log.Printf("FFmpeg command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
-	
+
 	cmd := exec.Command(fm.ffmpegPath, args...)
 	cmd.Stderr = os.Stderr
-	
+
 	return cmd.Run()
 }
 
@@ -228,12 +324,12 @@ func (fm *FFmpegManager) TranscodeVideoToHLS(inputPath, outputDir, playlistName 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
 	}
-	
+
 	segmentDuration := options.SegmentDuration
 	if segmentDuration == 0 {
 		segmentDuration = 10
 	}
-	
+
 	args := []string{
 		"-i", inputPath,
 		"-c:v", options.VideoCodec,
@@ -248,64 +344,64 @@ func (fm *FFmpegManager) TranscodeVideoToHLS(inputPath, outputDir, playlistName 
 		"-hls_segment_filename", filepath.Join(outputDir, "segment_%03d.ts"),
 		filepath.Join(outputDir, playlistName),
 	}
-	
+
 	// Add hardware acceleration if enabled
 	if options.HardwareAccel && fm.config.HardwareAcceleration {
 		args = append([]string{"-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128"}, args...)
 	}
-	
+
 	// Add quality scaling if specified
 	if options.Width > 0 && options.Height > 0 {
 		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", options.Width, options.Height))
 	}
-	
+
 	if fm.config.Debug {
 		log.Printf("FFmpeg HLS command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
-	
+
 	cmd := exec.Command(fm.ffmpegPath, args...)
 	cmd.Stderr = os.Stderr
-	
+
 	return cmd.Run()
 }
 
 // StreamTranscode transcodes a video stream in real-time
 func (fm *FFmpegManager) StreamTranscode(inputPath string, w http.ResponseWriter, r *http.Request, options TranscodeOptions) error {
 	args := fm.buildStreamArgs(inputPath, options)
-	
+
 	if fm.config.Debug {
 		log.Printf("FFmpeg stream command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
-	
+
 	cmd := exec.Command(fm.ffmpegPath, args...)
-	
+
 	// Set up pipes
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %v", err)
 	}
-	
+
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stderr pipe: %v", err)
 	}
-	
+
 	// Start the command
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start ffmpeg: %v", err)
 	}
-	
+
 	// Set response headers
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Cache-Control", "no-cache")
-	
+
 	// Stream the output
 	go func() {
 		defer cmd.Wait()
 		io.Copy(w, stdout)
 	}()
-	
+
 	// Log stderr if debug is enabled
 	if fm.config.Debug {
 		go func() {
@@ -315,7 +411,7 @@ func (fm *FFmpegManager) StreamTranscode(inputPath string, w http.ResponseWriter
 			}
 		}()
 	}
-	
+
 	return nil
 }
 
@@ -329,51 +425,83 @@ func (fm *FFmpegManager) GenerateThumbnail(inputPath, outputPath string, timeOff
 		"-y", // Overwrite output file
 		outputPath,
 	}
-	
+
 	if fm.config.Debug {
 		log.Printf("FFmpeg thumbnail command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
-	
+
 	cmd := exec.Command(fm.ffmpegPath, args...)
 	cmd.Stderr = os.Stderr
-	
+
 	return cmd.Run()
 }
 
-// GetHardwareAccelerationInfo gets information about available hardware acceleration
+// GetHardwareAccelerationInfo gets information about available hardware acceleration (matching Node.js server.js)
 func (fm *FFmpegManager) GetHardwareAccelerationInfo() map[string]interface{} {
 	info := make(map[string]interface{})
-	
-	// Test VAAPI
+	var profiles []string
+
+	// Test VAAPI (matching Node.js behavior)
 	if fm.testHardwareAccel("vaapi") {
 		info["vaapi"] = map[string]interface{}{
 			"available": true,
 			"device":    "/dev/dri/renderD128",
 		}
+		profiles = append(profiles, "vaapi-renderD128")
 	}
-	
-	// Test CUDA
+
+	// Test CUDA (matching Node.js behavior)
 	if fm.testHardwareAccel("cuda") {
 		info["cuda"] = map[string]interface{}{
 			"available": true,
 			"device":    "0",
 		}
+		profiles = append(profiles, "cuda")
 	}
-	
+
 	// Test VideoToolbox (macOS)
 	if fm.testHardwareAccel("videotoolbox") {
 		info["videotoolbox"] = map[string]interface{}{
 			"available": true,
 		}
+		profiles = append(profiles, "videotoolbox")
 	}
-	
+
+	// Test Intel Quick Sync (matching Node.js behavior)
+	if fm.testHardwareAccel("qsv") {
+		info["qsv"] = map[string]interface{}{
+			"available": true,
+			"device":    "/dev/dri/renderD128",
+		}
+		profiles = append(profiles, "qsv")
+	}
+
+	// Test NVIDIA NVENC (matching Node.js behavior)
+	if fm.testHardwareAccel("nvenc") {
+		info["nvenc"] = map[string]interface{}{
+			"available": true,
+			"device":    "0",
+		}
+		profiles = append(profiles, "nvenc")
+	}
+
+	// Add profiles array (matching Node.js behavior)
+	info["profiles"] = profiles
+
+	// Add default profile if none found
+	if len(profiles) == 0 {
+		info["defaultProfile"] = "software"
+	} else {
+		info["defaultProfile"] = profiles[0]
+	}
+
 	return info
 }
 
-// testHardwareAccel tests if a specific hardware acceleration is available
+// testHardwareAccel tests if a specific hardware acceleration is available (matching Node.js server.js)
 func (fm *FFmpegManager) testHardwareAccel(accelType string) bool {
 	var args []string
-	
+
 	switch accelType {
 	case "vaapi":
 		args = []string{"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=1", "-c:v", "h264_vaapi", "-f", "null", "-"}
@@ -381,109 +509,113 @@ func (fm *FFmpegManager) testHardwareAccel(accelType string) bool {
 		args = []string{"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=1", "-c:v", "h264_nvenc", "-f", "null", "-"}
 	case "videotoolbox":
 		args = []string{"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=1", "-c:v", "h264_videotoolbox", "-f", "null", "-"}
+	case "qsv":
+		args = []string{"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=1", "-c:v", "h264_qsv", "-f", "null", "-"}
+	case "nvenc":
+		args = []string{"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=1", "-c:v", "h264_nvenc", "-f", "null", "-"}
 	default:
 		return false
 	}
-	
+
 	cmd := exec.Command(fm.ffmpegPath, args...)
 	cmd.Stderr = io.Discard
 	cmd.Stdout = io.Discard
-	
+
 	return cmd.Run() == nil
 }
 
 // buildTranscodeArgs builds FFmpeg arguments for transcoding
 func (fm *FFmpegManager) buildTranscodeArgs(inputPath, outputPath string, options TranscodeOptions) []string {
 	args := []string{"-i", inputPath}
-	
+
 	// Add hardware acceleration if enabled
 	if options.HardwareAccel && fm.config.HardwareAcceleration {
 		args = append(args, "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128")
 	}
-	
+
 	// Video codec
 	if options.VideoCodec != "" {
 		args = append(args, "-c:v", options.VideoCodec)
 	}
-	
+
 	// Audio codec
 	if options.AudioCodec != "" {
 		args = append(args, "-c:a", options.AudioCodec)
 	}
-	
+
 	// Video bitrate
 	if options.VideoBitRate > 0 {
 		args = append(args, "-b:v", strconv.Itoa(options.VideoBitRate)+"k")
 	}
-	
+
 	// Audio bitrate
 	if options.AudioBitRate > 0 {
 		args = append(args, "-b:a", strconv.Itoa(options.AudioBitRate)+"k")
 	}
-	
+
 	// Resolution
 	if options.Width > 0 && options.Height > 0 {
 		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", options.Width, options.Height))
 	}
-	
+
 	// Frame rate
 	if options.FrameRate > 0 {
 		args = append(args, "-r", strconv.Itoa(options.FrameRate))
 	}
-	
+
 	// Quality
 	if options.Quality > 0 {
 		args = append(args, "-crf", strconv.Itoa(options.Quality))
 	}
-	
+
 	// Output format
 	if options.OutputFormat != "" {
 		args = append(args, "-f", options.OutputFormat)
 	}
-	
+
 	// Overwrite output
 	args = append(args, "-y", outputPath)
-	
+
 	return args
 }
 
 // buildStreamArgs builds FFmpeg arguments for streaming
 func (fm *FFmpegManager) buildStreamArgs(inputPath string, options TranscodeOptions) []string {
 	args := []string{"-i", inputPath}
-	
+
 	// Add hardware acceleration if enabled
 	if options.HardwareAccel && fm.config.HardwareAcceleration {
 		args = append(args, "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128")
 	}
-	
+
 	// Video codec
 	if options.VideoCodec != "" {
 		args = append(args, "-c:v", options.VideoCodec)
 	}
-	
+
 	// Audio codec
 	if options.AudioCodec != "" {
 		args = append(args, "-c:a", options.AudioCodec)
 	}
-	
+
 	// Video bitrate
 	if options.VideoBitRate > 0 {
 		args = append(args, "-b:v", strconv.Itoa(options.VideoBitRate)+"k")
 	}
-	
+
 	// Audio bitrate
 	if options.AudioBitRate > 0 {
 		args = append(args, "-b:a", strconv.Itoa(options.AudioBitRate)+"k")
 	}
-	
+
 	// Resolution
 	if options.Width > 0 && options.Height > 0 {
 		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", options.Width, options.Height))
 	}
-	
+
 	// Output to stdout
 	args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "-")
-	
+
 	return args
 }
 
@@ -496,18 +628,18 @@ func (fm *FFmpegManager) ExtractAudio(inputPath, outputPath string, format strin
 		"-y",
 		outputPath,
 	}
-	
+
 	if format != "" {
 		args = append(args, "-f", format)
 	}
-	
+
 	if fm.config.Debug {
 		log.Printf("FFmpeg audio extraction command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
-	
+
 	cmd := exec.Command(fm.ffmpegPath, args...)
 	cmd.Stderr = os.Stderr
-	
+
 	return cmd.Run()
 }
 
@@ -519,21 +651,21 @@ func (fm *FFmpegManager) GetStreamInfo(inputPath string) ([]StreamInfo, error) {
 		"-show_streams",
 		inputPath,
 	}
-	
+
 	cmd := exec.Command(fm.ffprobePath, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe failed: %v", err)
 	}
-	
+
 	var result struct {
 		Streams []StreamInfo `json:"streams"`
 	}
-	
+
 	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse ffprobe output: %v", err)
 	}
-	
+
 	return result.Streams, nil
 }
 
@@ -545,18 +677,18 @@ func (fm *FFmpegManager) GetDuration(inputPath string) (float64, error) {
 		"-of", "csv=p=0",
 		inputPath,
 	}
-	
+
 	cmd := exec.Command(fm.ffprobePath, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("ffprobe failed: %v", err)
 	}
-	
+
 	duration, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse duration: %v", err)
 	}
-	
+
 	return duration, nil
 }
 
@@ -569,18 +701,18 @@ func (fm *FFmpegManager) GetFrameRate(inputPath string) (float64, error) {
 		"-of", "csv=p=0",
 		inputPath,
 	}
-	
+
 	cmd := exec.Command(fm.ffprobePath, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("ffprobe failed: %v", err)
 	}
-	
+
 	frameRateStr := strings.TrimSpace(string(output))
 	if frameRateStr == "" {
 		return 0, fmt.Errorf("no video stream found")
 	}
-	
+
 	// Parse frame rate (e.g., "30/1" or "29.97")
 	parts := strings.Split(frameRateStr, "/")
 	if len(parts) == 2 {
@@ -594,12 +726,606 @@ func (fm *FFmpegManager) GetFrameRate(inputPath string) (float64, error) {
 		}
 		return num / den, nil
 	}
-	
+
 	// Try parsing as decimal
 	frameRate, err := strconv.ParseFloat(frameRateStr, 64)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse frame rate: %v", err)
 	}
-	
+
 	return frameRate, nil
-} 
+}
+
+// GetProbeInfo gets video information and transforms it to the expected probe format
+func (fm *FFmpegManager) GetProbeInfo(inputPath string) (*ProbeResponse, error) {
+	// Use the timeout version with a reasonable default timeout
+	return fm.GetProbeInfoWithTimeout(inputPath, 30*time.Second)
+}
+
+// GetProbeInfoWithTimeout gets video information with a specific timeout (matching Node.js server.js behavior)
+func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.Duration) (*ProbeResponse, error) {
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Check if ffprobe is available
+	if fm.ffprobePath == "" {
+		log.Printf("FFprobe not available, using fallback for %s", inputPath)
+		return fm.getFallbackProbeInfo(inputPath)
+	}
+
+	// Check if input file exists
+	if _, err := os.Stat(inputPath); err != nil {
+		log.Printf("Input file does not exist: %s, error: %v", inputPath, err)
+		return fm.getFallbackProbeInfo(inputPath)
+	}
+
+	// Get raw ffprobe output with more detailed information
+	args := []string{
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		inputPath,
+	}
+
+	log.Printf("Running ffprobe: %s %v", fm.ffprobePath, args)
+
+	cmd := exec.CommandContext(ctx, fm.ffprobePath, args...)
+	output, err := cmd.Output()
+	if err != nil {
+		// Check if it's a timeout error
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("FFprobe timeout after %v for %s", timeout, inputPath)
+			return nil, fmt.Errorf("ffprobe timeout after %v", timeout)
+		}
+		// If ffprobe fails, try to get basic file information
+		log.Printf("FFprobe failed for %s: %v, attempting fallback", inputPath, err)
+		return fm.getFallbackProbeInfo(inputPath)
+	}
+
+	log.Printf("FFprobe output length: %d bytes for %s", len(output), inputPath)
+	fmt.Printf("\n==== FFPROBE RAW OUTPUT for %s ===\n%s\n==== END FFPROBE RAW OUTPUT ===\n\n", inputPath, string(output))
+
+	// Parse the raw JSON output
+	var rawData map[string]interface{}
+	if err := json.Unmarshal(output, &rawData); err != nil {
+		log.Printf("Failed to parse ffprobe output for %s: %v, attempting fallback", inputPath, err)
+		log.Printf("Raw output: %s", string(output))
+		return fm.getFallbackProbeInfo(inputPath)
+	}
+
+	// Check if we got any meaningful data
+	if len(rawData) == 0 {
+		log.Printf("FFprobe returned empty data for %s, attempting fallback", inputPath)
+		return fm.getFallbackProbeInfo(inputPath)
+	}
+
+	log.Printf("FFprobe successful for %s, format: %v, streams: %d", inputPath, rawData["format"], len(rawData["streams"].([]interface{})))
+
+	// Transform to expected format
+	response := &ProbeResponse{
+		Samples: make(map[string]interface{}),
+	}
+
+	// Extract format information
+	if formatData, ok := rawData["format"].(map[string]interface{}); ok {
+		response.Format.Name = fm.extractFormatName(formatData)
+
+		// Try multiple methods to get duration
+		duration := fm.extractDuration(formatData)
+		if duration > 0 {
+			response.Format.Duration = duration
+		} else {
+			// If format doesn't have duration, try to calculate from streams
+			if streamsData, ok := rawData["streams"].([]interface{}); ok {
+				for _, streamData := range streamsData {
+					if stream, ok := streamData.(map[string]interface{}); ok {
+						if streamDuration := fm.extractStreamDuration(stream); streamDuration > duration {
+							duration = streamDuration
+						}
+					}
+				}
+				response.Format.Duration = duration
+			}
+		}
+	}
+
+	// Extract streams information
+	if streamsData, ok := rawData["streams"].([]interface{}); ok {
+		for i, streamData := range streamsData {
+			if stream, ok := streamData.(map[string]interface{}); ok {
+				probeStream := fm.transformStream(stream, i)
+				response.Streams = append(response.Streams, probeStream)
+			}
+		}
+	}
+
+	// If we still don't have duration, try to get it from the file size and bitrate
+	if response.Format.Duration == 0 {
+		if formatData, ok := rawData["format"].(map[string]interface{}); ok {
+			if size, ok := formatData["size"].(string); ok {
+				if fileSize, err := strconv.ParseInt(size, 10, 64); err == nil {
+					if bitRate, ok := formatData["bit_rate"].(string); ok {
+						if br, err := strconv.ParseInt(bitRate, 10, 64); err == nil && br > 0 {
+							// Calculate duration from file size and bitrate
+							response.Format.Duration = float64(fileSize*8) / float64(br)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If we still don't have any meaningful data, use fallback
+	if response.Format.Duration == 0 && len(response.Streams) == 0 {
+		log.Printf("No meaningful data extracted from ffprobe for %s, using fallback", inputPath)
+		return fm.getFallbackProbeInfo(inputPath)
+	}
+
+	return response, nil
+}
+
+// getFallbackProbeInfo provides basic file information when ffprobe fails
+func (fm *FFmpegManager) getFallbackProbeInfo(inputPath string) (*ProbeResponse, error) {
+	response := &ProbeResponse{
+		Format: ProbeFormat{
+			Name:     "unknown",
+			Duration: 0,
+		},
+		Streams: []ProbeStream{},
+		Samples: make(map[string]interface{}),
+	}
+
+	// Try to get basic file information
+	if stat, err := os.Stat(inputPath); err == nil {
+		// Try to determine format from file extension
+		ext := strings.ToLower(filepath.Ext(inputPath))
+		switch ext {
+		case ".mp4", ".m4v":
+			response.Format.Name = "mp4"
+		case ".mkv":
+			response.Format.Name = "matroska"
+		case ".avi":
+			response.Format.Name = "avi"
+		case ".mov":
+			response.Format.Name = "mov"
+		case ".webm":
+			response.Format.Name = "webm"
+		case ".flv":
+			response.Format.Name = "flv"
+		case ".wmv":
+			response.Format.Name = "wmv"
+		case ".ts", ".mts":
+			response.Format.Name = "mpegts"
+		default:
+			response.Format.Name = "unknown"
+		}
+
+		// For incomplete files, we can't determine duration accurately
+		// But we can provide a basic video stream entry
+		response.Streams = append(response.Streams, ProbeStream{
+			ID:               0,
+			Index:            0,
+			Track:            "video",
+			Codec:            "unknown",
+			StreamBitRate:    0,
+			StreamMaxBitRate: 0,
+			StartTime:        0,
+			StartTimeTs:      0,
+			Timescale:        1000,
+			Width:            0,
+			Height:           0,
+			FrameRate:        0,
+			NumberOfFrames:   nil,
+			IsHdr:            false,
+			IsDoVi:           false,
+			HasBFrames:       false,
+			FormatBitRate:    0,
+			FormatMaxBitRate: 0,
+			Bps:              0,
+			NumberOfBytes:    stat.Size(),
+			FormatDuration:   0,
+			Language:         "eng",
+		})
+
+		// Add a basic audio stream entry
+		response.Streams = append(response.Streams, ProbeStream{
+			ID:               0,
+			Index:            1,
+			Track:            "audio",
+			Codec:            "unknown",
+			StreamBitRate:    0,
+			StreamMaxBitRate: 0,
+			StartTime:        0,
+			StartTimeTs:      0,
+			Timescale:        1000,
+			SampleRate:       0,
+			Channels:         0,
+			ChannelLayout:    "",
+			Title:            nil,
+			Language:         "eng",
+		})
+	}
+
+	return response, nil
+}
+
+// extractDuration extracts duration from format data using multiple methods
+func (fm *FFmpegManager) extractDuration(formatData map[string]interface{}) float64 {
+	// Try duration field first
+	if duration, ok := formatData["duration"].(string); ok {
+		if dur, err := strconv.ParseFloat(duration, 64); err == nil && dur > 0 {
+			return dur
+		}
+	}
+
+	// Try duration as float
+	if duration, ok := formatData["duration"].(float64); ok && duration > 0 {
+		return duration
+	}
+
+	// Try start_time and end_time calculation
+	if startTime, ok := formatData["start_time"].(string); ok {
+		if endTime, ok := formatData["end_time"].(string); ok {
+			if start, err := strconv.ParseFloat(startTime, 64); err == nil {
+				if end, err := strconv.ParseFloat(endTime, 64); err == nil {
+					return end - start
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+// extractStreamDuration extracts duration from a stream
+func (fm *FFmpegManager) extractStreamDuration(stream map[string]interface{}) float64 {
+	// Try duration field
+	if duration, ok := stream["duration"].(string); ok {
+		if dur, err := strconv.ParseFloat(duration, 64); err == nil && dur > 0 {
+			return dur
+		}
+	}
+
+	// Try duration as float
+	if duration, ok := stream["duration"].(float64); ok && duration > 0 {
+		return duration
+	}
+
+	// Try tags.duration
+	if tags, ok := stream["tags"].(map[string]interface{}); ok {
+		if duration, ok := tags["duration"].(string); ok {
+			if dur, err := strconv.ParseFloat(duration, 64); err == nil && dur > 0 {
+				return dur
+			}
+		}
+	}
+
+	return 0
+}
+
+// extractFormatName extracts the format name from ffprobe output
+func (fm *FFmpegManager) extractFormatName(formatData map[string]interface{}) string {
+	// Try to get format name from various possible fields
+	if formatName, ok := formatData["format_name"].(string); ok {
+		return formatName
+	}
+	if formatLongName, ok := formatData["format_long_name"].(string); ok {
+		return formatLongName
+	}
+	return "unknown"
+}
+
+// transformStream transforms a raw stream object to ProbeStream format
+func (fm *FFmpegManager) transformStream(stream map[string]interface{}, index int) ProbeStream {
+	probeStream := ProbeStream{
+		ID:               0,
+		Index:            index,
+		StreamBitRate:    0,
+		StreamMaxBitRate: 0,
+		StartTime:        0,
+		StartTimeTs:      0,
+		Timescale:        1000,
+		IsHdr:            false,
+		IsDoVi:           false,
+		HasBFrames:       false,
+		FormatBitRate:    0,
+		FormatMaxBitRate: 0,
+		Bps:              0,
+		NumberOfBytes:    0,
+		FormatDuration:   0,
+		Language:         "eng", // Default language
+	}
+
+	// Extract codec information
+	if codecName, ok := stream["codec_name"].(string); ok {
+		probeStream.Codec = codecName
+	}
+
+	// Determine track type
+	if codecType, ok := stream["codec_type"].(string); ok {
+		switch codecType {
+		case "video":
+			probeStream.Track = "video"
+			probeStream = fm.extractVideoInfo(stream, probeStream)
+		case "audio":
+			probeStream.Track = "audio"
+			probeStream = fm.extractAudioInfo(stream, probeStream)
+		case "subtitle":
+			probeStream.Track = "subtitle"
+			probeStream = fm.extractSubtitleInfo(stream, probeStream)
+		}
+	}
+
+	// Extract common stream information
+	if bitRate, ok := stream["bit_rate"].(string); ok {
+		if br, err := strconv.Atoi(bitRate); err == nil {
+			probeStream.StreamBitRate = br
+			probeStream.Bps = br
+		}
+	} else if bitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.StreamBitRate = int(bitRate)
+		probeStream.Bps = int(bitRate)
+	}
+
+	if startTime, ok := stream["start_time"].(string); ok {
+		if st, err := strconv.ParseFloat(startTime, 64); err == nil {
+			probeStream.StartTime = int(st * 1000) // Convert to milliseconds
+		}
+	} else if startTime, ok := stream["start_time"].(float64); ok {
+		probeStream.StartTime = int(startTime * 1000) // Convert to milliseconds
+	}
+
+	if startTimeTs, ok := stream["start_pts"].(float64); ok {
+		probeStream.StartTimeTs = int(startTimeTs)
+	}
+
+	// Extract duration
+	if duration, ok := stream["duration"].(string); ok {
+		if dur, err := strconv.ParseFloat(duration, 64); err == nil {
+			probeStream.FormatDuration = dur
+		}
+	} else if duration, ok := stream["duration"].(float64); ok {
+		probeStream.FormatDuration = duration
+	}
+
+	// Extract language and title from tags
+	if tags, ok := stream["tags"].(map[string]interface{}); ok {
+		if lang, ok := tags["language"].(string); ok && lang != "" {
+			probeStream.Language = lang
+		}
+		if title, ok := tags["title"].(string); ok && title != "" {
+			probeStream.Title = &title
+		}
+		// Also check for language in other common fields
+		if lang, ok := tags["lang"].(string); ok && lang != "" && probeStream.Language == "eng" {
+			probeStream.Language = lang
+		}
+	}
+
+	// Extract format bitrate information
+	if formatBitRate, ok := stream["bit_rate"].(string); ok {
+		if fbr, err := strconv.Atoi(formatBitRate); err == nil {
+			probeStream.FormatBitRate = fbr
+		}
+	} else if formatBitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.FormatBitRate = int(formatBitRate)
+	}
+
+	return probeStream
+}
+
+// extractVideoInfo extracts video-specific information
+func (fm *FFmpegManager) extractVideoInfo(stream map[string]interface{}, probeStream ProbeStream) ProbeStream {
+	if width, ok := stream["width"].(float64); ok {
+		probeStream.Width = int(width)
+	}
+
+	if height, ok := stream["height"].(float64); ok {
+		probeStream.Height = int(height)
+	}
+
+	// Extract frame rate
+	if rFrameRate, ok := stream["r_frame_rate"].(string); ok {
+		if frameRate := fm.parseFrameRate(rFrameRate); frameRate > 0 {
+			probeStream.FrameRate = frameRate
+		}
+	} else if avgFrameRate, ok := stream["avg_frame_rate"].(string); ok {
+		if frameRate := fm.parseFrameRate(avgFrameRate); frameRate > 0 {
+			probeStream.FrameRate = frameRate
+		}
+	}
+
+	// Extract bitrate information
+	if bitRate, ok := stream["bit_rate"].(string); ok {
+		if br, err := strconv.Atoi(bitRate); err == nil {
+			probeStream.Bps = br
+		}
+	} else if bitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.Bps = int(bitRate)
+	}
+
+	// Check for HDR/DoVi (enhanced detection)
+	if codecName, ok := stream["codec_name"].(string); ok {
+		codecNameLower := strings.ToLower(codecName)
+		if strings.Contains(codecNameLower, "hevc") || strings.Contains(codecNameLower, "h265") {
+			probeStream.IsHdr = true
+		}
+	}
+
+	// Check for DoVi (Dolby Vision)
+	if profile, ok := stream["profile"].(string); ok {
+		if strings.Contains(strings.ToLower(profile), "dolby") || strings.Contains(strings.ToLower(profile), "dovi") {
+			probeStream.IsDoVi = true
+		}
+	}
+
+	// Check for B-frames
+	if hasBFrames, ok := stream["has_b_frames"].(float64); ok {
+		probeStream.HasBFrames = hasBFrames > 0
+	} else if hasBFrames, ok := stream["has_b_frames"].(string); ok {
+		if hasBFrames == "1" || strings.ToLower(hasBFrames) == "true" {
+			probeStream.HasBFrames = true
+		}
+	}
+
+	// Extract number of frames if available
+	if nbFrames, ok := stream["nb_frames"].(string); ok {
+		if frames, err := strconv.Atoi(nbFrames); err == nil && frames > 0 {
+			probeStream.NumberOfFrames = &frames
+		}
+	} else if nbFrames, ok := stream["nb_frames"].(float64); ok && nbFrames > 0 {
+		frames := int(nbFrames)
+		probeStream.NumberOfFrames = &frames
+	}
+
+	// Extract format bitrate for video streams
+	if bitRate, ok := stream["bit_rate"].(string); ok {
+		if br, err := strconv.Atoi(bitRate); err == nil {
+			probeStream.FormatBitRate = br
+		}
+	} else if bitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.FormatBitRate = int(bitRate)
+	}
+
+	return probeStream
+}
+
+// extractAudioInfo extracts audio-specific information
+func (fm *FFmpegManager) extractAudioInfo(stream map[string]interface{}, probeStream ProbeStream) ProbeStream {
+	if sampleRate, ok := stream["sample_rate"].(string); ok {
+		if sr, err := strconv.Atoi(sampleRate); err == nil {
+			probeStream.SampleRate = sr
+		}
+	} else if sampleRate, ok := stream["sample_rate"].(float64); ok {
+		probeStream.SampleRate = int(sampleRate)
+	}
+
+	if channels, ok := stream["channels"].(float64); ok {
+		probeStream.Channels = int(channels)
+	} else if channels, ok := stream["channels"].(string); ok {
+		if ch, err := strconv.Atoi(channels); err == nil {
+			probeStream.Channels = ch
+		}
+	}
+
+	// Extract channel layout
+	if channelLayout, ok := stream["channel_layout"].(string); ok && channelLayout != "" {
+		probeStream.ChannelLayout = channelLayout
+	}
+
+	// Extract audio bitrate
+	if bitRate, ok := stream["bit_rate"].(string); ok {
+		if br, err := strconv.Atoi(bitRate); err == nil {
+			probeStream.StreamBitRate = br
+			probeStream.Bps = br
+		}
+	} else if bitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.StreamBitRate = int(bitRate)
+		probeStream.Bps = int(bitRate)
+	}
+
+	// Extract format bitrate for audio streams
+	if bitRate, ok := stream["bit_rate"].(string); ok {
+		if br, err := strconv.Atoi(bitRate); err == nil {
+			probeStream.FormatBitRate = br
+		}
+	} else if bitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.FormatBitRate = int(bitRate)
+	}
+
+	// Extract language and title from tags if not already set
+	if tags, ok := stream["tags"].(map[string]interface{}); ok {
+		if probeStream.Language == "eng" {
+			if lang, ok := tags["language"].(string); ok && lang != "" {
+				probeStream.Language = lang
+			}
+		}
+		if probeStream.Title == nil {
+			if title, ok := tags["title"].(string); ok && title != "" {
+				probeStream.Title = &title
+			}
+		}
+	}
+
+	return probeStream
+}
+
+// extractSubtitleInfo extracts subtitle-specific information
+func (fm *FFmpegManager) extractSubtitleInfo(stream map[string]interface{}, probeStream ProbeStream) ProbeStream {
+	// Extract language and title from tags
+	if tags, ok := stream["tags"].(map[string]interface{}); ok {
+		if lang, ok := tags["language"].(string); ok && lang != "" {
+			probeStream.Language = lang
+		}
+		if title, ok := tags["title"].(string); ok && title != "" {
+			probeStream.Title = &title
+		}
+		// Also check for language in other common fields
+		if lang, ok := tags["lang"].(string); ok && lang != "" && probeStream.Language == "eng" {
+			probeStream.Language = lang
+		}
+	}
+
+	// Extract subtitle codec
+	if codecName, ok := stream["codec_name"].(string); ok {
+		probeStream.Codec = codecName
+	}
+
+	// Extract subtitle bitrate (usually 0 for subtitles)
+	if bitRate, ok := stream["bit_rate"].(string); ok {
+		if br, err := strconv.Atoi(bitRate); err == nil {
+			probeStream.StreamBitRate = br
+		}
+	} else if bitRate, ok := stream["bit_rate"].(float64); ok {
+		probeStream.StreamBitRate = int(bitRate)
+	}
+
+	return probeStream
+}
+
+// parseFrameRate parses frame rate from ffprobe format (e.g., "30/1", "29.97")
+func (fm *FFmpegManager) parseFrameRate(frameRateStr string) float64 {
+	parts := strings.Split(frameRateStr, "/")
+	if len(parts) == 2 {
+		num, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			return 0
+		}
+		den, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return 0
+		}
+		if den != 0 {
+			return num / den
+		}
+	}
+
+	// Try parsing as decimal
+	if frameRate, err := strconv.ParseFloat(frameRateStr, 64); err == nil {
+		return frameRate
+	}
+
+	return 0
+}
+
+// IsAvailable checks if FFmpeg is available for use
+func (fm *FFmpegManager) IsAvailable() bool {
+	return fm.ffmpegPath != ""
+}
+
+// IsProbeAvailable checks if FFprobe is available for use
+func (fm *FFmpegManager) IsProbeAvailable() bool {
+	return fm.ffprobePath != ""
+}
+
+// GetFFmpegPath returns the FFmpeg executable path
+func (fm *FFmpegManager) GetFFmpegPath() string {
+	return fm.ffmpegPath
+}
+
+// GetFFprobePath returns the FFprobe executable path
+func (fm *FFmpegManager) GetFFprobePath() string {
+	return fm.ffprobePath
+}
