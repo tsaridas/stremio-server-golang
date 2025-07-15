@@ -98,6 +98,7 @@ type TranscodeOptions struct {
 	HardwareAccel   bool
 	SegmentDuration int
 	OutputFormat    string
+	SubtitleStream  int
 }
 
 // ProbeResponse represents the expected JSON response format for /probe
@@ -571,6 +572,11 @@ func (fm *FFmpegManager) buildTranscodeArgs(inputPath, outputPath string, option
 	// Output format
 	if options.OutputFormat != "" {
 		args = append(args, "-f", options.OutputFormat)
+	}
+
+	// Subtitle stream
+	if options.SubtitleStream >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", options.SubtitleStream), "-c:s", "mov_text")
 	}
 
 	// Overwrite output
@@ -1313,6 +1319,75 @@ func (fm *FFmpegManager) parseFrameRate(frameRateStr string) float64 {
 // IsAvailable checks if FFmpeg is available for use
 func (fm *FFmpegManager) IsAvailable() bool {
 	return fm.ffmpegPath != ""
+}
+
+// RemuxStream remuxes a video, copying video/audio and including a single subtitle track
+func (fm *FFmpegManager) RemuxStream(inputPath string, w http.ResponseWriter, r *http.Request, subtitleTrack int) error {
+	args := []string{
+		"-i", inputPath,
+		"-c:v", "copy",
+		"-c:a", "copy",
+		"-map", "0:v:0",
+		"-map", "0:a:0",
+	}
+
+	if subtitleTrack >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", subtitleTrack), "-c:s", "mov_text")
+	}
+
+	args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "-")
+
+	if fm.config.Debug {
+		log.Printf("FFmpeg remux command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+	}
+
+	cmd := exec.Command(fm.ffmpegPath, args...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %v", err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start ffmpeg: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	go func() {
+		defer cmd.Wait()
+		io.Copy(w, stdout)
+	}()
+
+	if fm.config.Debug {
+		go func() {
+			scanner := bufio.NewScanner(stderr)
+			for scanner.Scan() {
+				log.Printf("FFmpeg: %s", scanner.Text())
+			}
+		}()
+	}
+
+	return nil
+}
+
+// RunFFmpeg executes a custom FFmpeg command with the given arguments
+func (fm *FFmpegManager) RunFFmpeg(args []string) error {
+	if fm.config.Debug {
+		log.Printf("FFmpeg custom command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+	}
+
+	cmd := exec.Command(fm.ffmpegPath, args...)
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
 }
 
 // IsProbeAvailable checks if FFprobe is available for use

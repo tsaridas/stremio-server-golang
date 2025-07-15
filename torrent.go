@@ -24,16 +24,45 @@ import (
 	"github.com/anacrolix/torrent/storage"
 )
 
+// Logger provides structured logging for torrent operations
+type TorrentLogger struct {
+	prefix string
+}
+
+func NewTorrentLogger(prefix string) *TorrentLogger {
+	return &TorrentLogger{prefix: prefix}
+}
+
+func (tl *TorrentLogger) Info(format string, args ...interface{}) {
+	log.Printf("[TORRENT-%s] INFO: "+format, append([]interface{}{tl.prefix}, args...)...)
+}
+
+func (tl *TorrentLogger) Error(format string, args ...interface{}) {
+	log.Printf("[TORRENT-%s] ERROR: "+format, append([]interface{}{tl.prefix}, args...)...)
+}
+
+func (tl *TorrentLogger) Debug(format string, args ...interface{}) {
+	log.Printf("[TORRENT-%s] DEBUG: "+format, append([]interface{}{tl.prefix}, args...)...)
+}
+
+func (tl *TorrentLogger) Warn(format string, args ...interface{}) {
+	log.Printf("[TORRENT-%s] WARN: "+format, append([]interface{}{tl.prefix}, args...)...)
+}
+
 // TorrentManager manages all torrent operations
 type TorrentManager struct {
 	client    *torrent.Client
 	engines   map[string]*TorrentEngine
 	mu        sync.RWMutex
 	cachePath string
+	logger    *TorrentLogger
 }
 
 // NewTorrentManager creates a new torrent manager
 func NewTorrentManager(cachePath string) (*TorrentManager, error) {
+	logger := NewTorrentLogger("MANAGER")
+	logger.Info("Initializing torrent manager with cache path: %s", cachePath)
+
 	// Set environment variables to reduce logging verbosity
 	if os.Getenv("TORRENT_LOGGER") == "" {
 		os.Setenv("TORRENT_LOGGER", "warning")
@@ -45,13 +74,12 @@ func NewTorrentManager(cachePath string) (*TorrentManager, error) {
 		os.Setenv("ANACROLIX_LOG_LEVEL", "warn")
 	}
 
-	// Use the passed cachePath parameter instead of hardcoding
-	// stremioCachePath := filepath.Join(os.Getenv("HOME"), ".stremio-server", "stremio-cache")
-
 	// Ensure cache directory exists
 	if err := ensureCacheDir(cachePath); err != nil {
+		logger.Error("Failed to create cache directory: %v", err)
 		return nil, fmt.Errorf("failed to create cache directory: %v", err)
 	}
+	logger.Info("Cache directory ensured: %s", cachePath)
 
 	config := torrent.NewDefaultClientConfig()
 	config.DataDir = cachePath // Use passed cachePath as data directory
@@ -79,27 +107,30 @@ func NewTorrentManager(cachePath string) (*TorrentManager, error) {
 	// Use custom storage backend to ensure files are written as <cachePath>/<infoHash>/<fileIndex>
 	config.DefaultStorage = NewCustomStorage(cachePath)
 
-	log.Printf("Creating torrent manager with cache directory: %s", cachePath)
+	logger.Info("Creating torrent client with optimized configuration")
 
 	client, err := torrent.NewClient(config)
 	if err != nil {
+		logger.Error("Failed to create torrent client: %v", err)
 		return nil, fmt.Errorf("failed to create torrent client: %v", err)
 	}
+	logger.Info("Torrent client created successfully")
 
 	tm := &TorrentManager{
 		client:    client,
 		engines:   make(map[string]*TorrentEngine),
-		cachePath: cachePath, // Store passed cachePath
+		cachePath: cachePath,
+		logger:    logger,
 	}
 
-	// No longer loading/saving torrent states to disk - keeping everything in memory
-	log.Printf("Torrent manager initialized with in-memory state only")
+	logger.Info("Torrent manager initialized with in-memory state only")
 
 	// Scan cache for existing torrents and load them
 	if err := tm.loadTorrentsFromCache(); err != nil {
-		log.Printf("Warning: Failed to load some torrents from cache: %v", err)
+		logger.Warn("Failed to load some torrents from cache: %v", err)
 	}
 
+	logger.Info("Torrent manager initialization complete")
 	return tm, nil
 }
 
@@ -129,23 +160,54 @@ func (tm *TorrentManager) AddTorrentWithConfig(magnetURI string, trackers []stri
 
 // AddTorrentWithFileIndex adds a torrent and only downloads the selected file
 func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []string, dhtEnabled bool, minPeers, maxPeers, fileIndex int) (*TorrentEngine, error) {
+	logger := NewTorrentLogger("ADD")
+
 	infoHash, err := GetTorrentInfoHash(magnetURI)
 	if err != nil {
+		logger.Error("Failed to get info hash from magnet URI: %v", err)
 		return nil, fmt.Errorf("failed to get info hash from magnet URI: %v", err)
 	}
 
+	logger.Info("Adding torrent %s with file index %d", infoHash, fileIndex)
+
 	tm.mu.Lock()
+
+	// Force restart: Remove existing cache to ensure download starts from beginning
+	cacheDir := filepath.Join(tm.cachePath, infoHash)
+	if _, err := os.Stat(cacheDir); err == nil {
+		logger.Info("Removing existing cache directory to force fresh download: %s", cacheDir)
+		if err := os.RemoveAll(cacheDir); err != nil {
+			logger.Warn("Failed to remove existing cache directory: %v", err)
+		} else {
+			logger.Info("Successfully removed existing cache directory")
+		}
+	}
+
+	// Remove existing engine if it exists to force fresh start
 	if existingEngine, exists := tm.engines[infoHash]; exists {
-		tm.mu.Unlock()
-		log.Printf("Torrent %s already exists, returning existing engine", infoHash)
-		return existingEngine, nil
+		logger.Info("Removing existing engine to force fresh start")
+		delete(tm.engines, infoHash)
+
+		// Stop existing torrent safely
+		if existingEngine.Torrent != nil {
+			select {
+			case <-existingEngine.stopChan:
+				// Channel already closed
+			default:
+				close(existingEngine.stopChan)
+			}
+			existingEngine.Torrent.Drop()
+			existingEngine.Torrent = nil
+		}
 	}
 	// Create magnet URI with custom trackers if provided
 	enhancedMagnetURI := magnetURI
 	if len(trackers) > 0 {
+		logger.Info("Adding %d custom trackers to magnet URI", len(trackers))
 		parsedURL, err := url.Parse(magnetURI)
 		if err != nil {
 			tm.mu.Unlock()
+			logger.Error("Failed to parse magnet URI: %v", err)
 			return nil, fmt.Errorf("failed to parse magnet URI: %v", err)
 		}
 		query := parsedURL.Query()
@@ -154,25 +216,38 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 		}
 		parsedURL.RawQuery = query.Encode()
 		enhancedMagnetURI = parsedURL.String()
+		logger.Debug("Enhanced magnet URI: %s", enhancedMagnetURI)
 	}
+
+	logger.Info("Adding torrent to client with DHT=%v, peers=%d-%d", dhtEnabled, minPeers, maxPeers)
 	t, err := AddTorrentWithConfig(tm.client, infoHash, enhancedMagnetURI, trackers, dhtEnabled, minPeers, maxPeers)
 	if err != nil {
 		tm.mu.Unlock()
+		logger.Error("Failed to add magnet to client: %v", err)
 		return nil, fmt.Errorf("failed to add magnet: %v", err)
 	}
+
+	logger.Info("Waiting for torrent metadata...")
 	<-t.GotInfo()
+	logger.Info("Torrent metadata received: %s", t.Info().Name)
+
 	optimizeTorrentSettings(t)
 
 	numFiles := len(t.Files())
+	logger.Info("Torrent has %d files, configuring file priorities for index %d", numFiles, fileIndex)
+
 	if fileIndex < 0 || fileIndex >= numFiles {
 		// If fileIndex is invalid, set all files to normal (legacy behavior)
+		logger.Info("Invalid file index %d, downloading all files", fileIndex)
 		for _, file := range t.Files() {
 			file.SetPriority(torrent.PiecePriorityNormal)
 		}
 	} else {
+		logger.Info("Setting priority for file %d only", fileIndex)
 		for i, file := range t.Files() {
 			if i == fileIndex {
 				file.SetPriority(torrent.PiecePriorityNormal)
+				logger.Debug("File %d (%s) set to normal priority", i, file.DisplayPath())
 			} else {
 				file.SetPriority(torrent.PiecePriorityNone)
 			}
@@ -180,11 +255,13 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 	}
 
 	infoHashStr := t.InfoHash().String()
+	logger.Info("Creating torrent engine for %s", infoHashStr)
+
 	engine := &TorrentEngine{
 		InfoHash:          infoHashStr,
 		Torrent:           t,
 		Files:             make([]TorrentFile, 0, len(t.Files())),
-		Status:            "downloading",
+		Status:            "starting",
 		Peers:             0,
 		Downloaded:        0,
 		TotalSize:         0,
@@ -199,6 +276,7 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 		TorrentInfo:       t.Info(),
 		MetadataFetched:   true,
 		MetadataFetchedAt: time.Now(),
+		logger:            NewTorrentLogger(infoHashStr[:8]),
 	}
 	for i, file := range t.Files() {
 		tf := TorrentFile{
@@ -209,9 +287,16 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 		}
 		engine.Files = append(engine.Files, tf)
 		engine.TotalSize += file.Length()
+		logger.Debug("Added file %d: %s (size: %d bytes)", i, tf.Name, tf.Size)
 	}
+
 	tm.engines[infoHashStr] = engine
 	tm.mu.Unlock()
+
+	// Start monitoring the torrent
+	go engine.monitor()
+
+	logger.Info("Torrent engine created and monitoring started for %s", infoHashStr)
 	return engine, nil
 }
 
@@ -402,6 +487,7 @@ func (tm *TorrentManager) loadTorrentsFromCache() error {
 			TorrentInfo:       &info,
 			MetadataFetched:   true,
 			MetadataFetchedAt: time.Now(),
+			logger:            NewTorrentLogger(infoHash[:8]),
 		}
 
 		// Build file list from info
@@ -570,8 +656,9 @@ type TorrentEngine struct {
 	DHTEnabled         bool
 	MinPeers           int
 	MaxPeers           int
-	stopChan           chan struct{} // Channel to signal monitor goroutine to stop
-	lastLoggedProgress int           // Track last logged progress percentage to avoid duplicates
+	stopChan           chan struct{}  // Channel to signal monitor goroutine to stop
+	lastLoggedProgress int            // Track last logged progress percentage to avoid duplicates
+	logger             *TorrentLogger // Logger for this torrent
 
 	// Persistent metadata - stored even after torrent is dropped
 	TorrentName       string         // Store torrent name
@@ -584,21 +671,34 @@ type TorrentEngine struct {
 func (e *TorrentEngine) monitor() {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Recovered from panic in monitor for torrent %s: %v", e.InfoHash, r)
+			if e.logger != nil {
+				e.logger.Error("Recovered from panic in monitor: %v", r)
+			} else {
+				log.Printf("Recovered from panic in monitor for torrent %s: %v", e.InfoHash, r)
+			}
 		}
 	}()
+
+	if e.logger != nil {
+		e.logger.Info("Starting torrent monitor")
+	}
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-e.stopChan:
-			log.Printf("Torrent %s monitor stopped by signal", e.InfoHash)
+			if e.logger != nil {
+				e.logger.Info("Monitor stopped by signal")
+			}
 			return
 		case <-ticker.C:
 			// Check if torrent still exists before updating status
 			if e.Torrent == nil {
-				log.Printf("Torrent %s no longer exists, stopping monitor", e.InfoHash)
+				if e.logger != nil {
+					e.logger.Info("Torrent no longer exists, stopping monitor")
+				}
 				return
 			}
 
@@ -612,7 +712,9 @@ func (e *TorrentEngine) monitor() {
 				default:
 				}
 				if !closed && e.Torrent.Complete.Bool() {
-					log.Printf("Torrent %s download complete, stopping torrent and DHT", e.InfoHash)
+					if e.logger != nil {
+						e.logger.Info("Download complete, stopping torrent and DHT")
+					}
 
 					// Persist file list and metadata before dropping torrent
 					if e.Torrent != nil && e.Torrent.Info() != nil {
@@ -635,7 +737,9 @@ func (e *TorrentEngine) monitor() {
 						}
 						e.mu.Unlock()
 
-						log.Printf("Persisted file list for completed torrent %s: %d files", e.InfoHash, len(e.Files))
+						if e.logger != nil {
+							e.logger.Info("Persisted file list: %d files", len(e.Files))
+						}
 					}
 
 					// Stop DHT network
@@ -650,6 +754,9 @@ func (e *TorrentEngine) monitor() {
 			}
 
 		case <-e.Torrent.Closed():
+			if e.logger != nil {
+				e.logger.Info("Torrent closed, stopping monitor")
+			}
 			return
 		}
 	}
@@ -662,6 +769,9 @@ func (e *TorrentEngine) updateStatus() {
 
 	// Check if torrent still exists
 	if e.Torrent == nil {
+		if e.logger != nil {
+			e.logger.Debug("Torrent is nil, skipping status update")
+		}
 		return
 	}
 
@@ -674,8 +784,10 @@ func (e *TorrentEngine) updateStatus() {
 
 	// Debug: log if bytes completed decreased
 	if newDownloaded < oldDownloaded {
-		log.Printf("⚠️  WARNING: Bytes completed decreased for torrent %s: %d -> %d (diff: %d)",
-			e.InfoHash, oldDownloaded, newDownloaded, oldDownloaded-newDownloaded)
+		if e.logger != nil {
+			e.logger.Warn("Bytes completed decreased: %d -> %d (diff: %d)",
+				oldDownloaded, newDownloaded, oldDownloaded-newDownloaded)
+		}
 	}
 
 	e.Downloaded = newDownloaded
@@ -715,7 +827,7 @@ func (e *TorrentEngine) updateStatus() {
 		e.lastLoggedProgress = currentProgressInt // Update the last logged progress
 	}
 
-	if shouldLog {
+	if shouldLog && e.logger != nil {
 		speedMBps := float64(downloadSpeed) / (1024 * 1024) // Convert to MB/s (fixed calculation)
 
 		// Get additional diagnostic information
@@ -725,17 +837,17 @@ func (e *TorrentEngine) updateStatus() {
 			activePeers = stats.TotalPeers
 		}
 
-		log.Printf("📥 Torrent %s: %.1f%% complete | %d peers (%d active) | %.1f MB/s | %d/%d bytes | status: %s",
-			e.InfoHash, progress, e.Peers, activePeers, speedMBps, e.Downloaded, e.TotalSize, e.Status)
+		e.logger.Info("%.1f%% complete | %d peers (%d active) | %.1f MB/s | %d/%d bytes | status: %s",
+			progress, e.Peers, activePeers, speedMBps, e.Downloaded, e.TotalSize, e.Status)
 
 		// Log warning if download speed is very low
 		if speedMBps < 0.1 && progress > 5 && e.Peers > 0 {
-			log.Printf("⚠️  WARNING: Low download speed (%.1f MB/s) for torrent %s with %d peers", speedMBps, e.InfoHash, e.Peers)
+			e.logger.Warn("Low download speed (%.1f MB/s) with %d peers", speedMBps, e.Peers)
 		}
 
 		// Log warning if no peers after reasonable time
 		if e.Peers == 0 && time.Since(e.CreatedAt).Seconds() > 30 {
-			log.Printf("⚠️  WARNING: No peers found for torrent %s after 30 seconds", e.InfoHash)
+			e.logger.Warn("No peers found after 30 seconds")
 		}
 	}
 }
@@ -830,14 +942,33 @@ func (e *TorrentEngine) GetFile(index int) (*TorrentFile, error) {
 
 // StreamFile streams a file with range support
 func (e *TorrentEngine) StreamFile(fileIndex int, w http.ResponseWriter, r *http.Request) error {
+	if e.logger != nil {
+		e.logger.Info("Streaming file %d", fileIndex)
+	}
+
 	// Fallback: Serve from disk if e.Torrent is nil
 	if e.Torrent == nil {
+		if e.logger != nil {
+			e.logger.Info("Torrent is nil, serving from disk cache")
+		}
+
 		if fileIndex < 0 || fileIndex >= len(e.Files) {
+			if e.logger != nil {
+				e.logger.Error("Invalid file index: %d (available: 0-%d)", fileIndex, len(e.Files)-1)
+			}
 			return fmt.Errorf("invalid file index: %d", fileIndex)
 		}
+
 		file := e.Files[fileIndex]
+		if e.logger != nil {
+			e.logger.Debug("Opening cached file: %s", file.Path)
+		}
+
 		f, err := os.Open(file.Path)
 		if err != nil {
+			if e.logger != nil {
+				e.logger.Error("Failed to open cached file: %v", err)
+			}
 			return fmt.Errorf("failed to open file from disk: %w", err)
 		}
 		defer f.Close()
@@ -885,6 +1016,9 @@ func (e *TorrentEngine) StreamFile(fileIndex int, w http.ResponseWriter, r *http
 	}
 
 	if fileIndex < 0 || fileIndex >= len(e.Torrent.Files()) {
+		if e.logger != nil {
+			e.logger.Error("Invalid file index for live torrent: %d (available: 0-%d)", fileIndex, len(e.Torrent.Files())-1)
+		}
 		return fmt.Errorf("invalid file index: %d", fileIndex)
 	}
 
@@ -892,8 +1026,10 @@ func (e *TorrentEngine) StreamFile(fileIndex int, w http.ResponseWriter, r *http
 	bytesCompleted := file.BytesCompleted()
 	fileLength := file.Length()
 
-	log.Printf("StreamFile: streaming file %d (%s), length: %d, completed: %d, complete: %v",
-		fileIndex, file.DisplayPath(), fileLength, bytesCompleted, bytesCompleted == fileLength)
+	if e.logger != nil {
+		e.logger.Info("Streaming live file %d (%s), length: %d, completed: %d, complete: %v",
+			fileIndex, file.DisplayPath(), fileLength, bytesCompleted, bytesCompleted == fileLength)
+	}
 
 	// Parse range header
 	rangeHeader := r.Header.Get("Range")
@@ -919,17 +1055,26 @@ func (e *TorrentEngine) StreamFile(fileIndex int, w http.ResponseWriter, r *http
 		end = fileLength - 1
 	}
 
-	log.Printf("StreamFile: range request: %d-%d", start, end)
+	if e.logger != nil {
+		e.logger.Debug("Range request: %d-%d", start, end)
+	}
 
 	// Check if the requested range is available
 	if end >= bytesCompleted {
-		log.Printf("StreamFile: requested range %d-%d exceeds available bytes %d", start, end, bytesCompleted)
+		if e.logger != nil {
+			e.logger.Warn("Requested range %d-%d exceeds available bytes %d", start, end, bytesCompleted)
+		}
 		if bytesCompleted == 0 {
+			if e.logger != nil {
+				e.logger.Error("File not yet downloaded")
+			}
 			return fmt.Errorf("file not yet downloaded")
 		}
 		// Adjust end to available bytes
 		end = bytesCompleted - 1
-		log.Printf("StreamFile: adjusted range to %d-%d", start, end)
+		if e.logger != nil {
+			e.logger.Info("Adjusted range to %d-%d", start, end)
+		}
 	}
 
 	// Set headers
@@ -963,13 +1108,19 @@ func (e *TorrentEngine) StreamFile(fileIndex int, w http.ResponseWriter, r *http
 	select {
 	case err := <-done:
 		if err != nil {
-			log.Printf("StreamFile: error streaming file %d: %v", fileIndex, err)
+			if e.logger != nil {
+				e.logger.Error("Error streaming file %d: %v", fileIndex, err)
+			}
 		} else {
-			log.Printf("StreamFile: successfully streamed file %d", fileIndex)
+			if e.logger != nil {
+				e.logger.Info("Successfully streamed file %d", fileIndex)
+			}
 		}
 		return err
 	case <-time.After(30 * time.Second):
-		log.Printf("StreamFile: timeout streaming file %d", fileIndex)
+		if e.logger != nil {
+			e.logger.Error("Timeout streaming file %d", fileIndex)
+		}
 		return fmt.Errorf("streaming timeout")
 	}
 }

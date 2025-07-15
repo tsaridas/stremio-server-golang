@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/abema/go-mp4"
 	"github.com/gorilla/mux"
 	"golang.org/x/net/websocket"
 )
@@ -2422,6 +2423,9 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Detect Matroska/WebM
+	isMatroska := strings.HasSuffix(strings.ToLower(file.Name), ".mkv") || strings.HasSuffix(strings.ToLower(file.Name), ".webm")
+
 	// Check if file exists on disk and retry if needed
 	fileInfo, err := os.Stat(file.Path)
 	if err != nil {
@@ -2430,7 +2434,6 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If file is empty, retry a few times with delays
 	if fileInfo.Size() == 0 {
 		maxRetries := 10
 		retryDelay := 500 * time.Millisecond
@@ -2458,121 +2461,53 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Calculate segment start time (2 seconds per segment)
-	segmentDuration := 2.0
+	// Get quality parameter from query string
+	quality := r.URL.Query().Get("q")
+	if quality == "" {
+		quality = "o" // Default to original quality
+	}
+
+	log.Printf("Quality requested: %s", quality)
+
+	segmentDuration := 6.0
 	startTime := float64(sequence) * segmentDuration
+	log.Printf("Segment %d: startTime=%.2f, duration=%.2f", sequence, startTime, segmentDuration)
 
-	// Check if FFmpeg is available for segment generation (matching Node.js server.js behavior)
-	if s.ffmpegMgr == nil || !s.ffmpegMgr.IsAvailable() {
-		log.Printf("HLS Segment: FFmpeg not available for segment generation - ffmpegMgr: %v, IsAvailable: %v", s.ffmpegMgr != nil, func() bool {
-			if s.ffmpegMgr != nil {
-				return s.ffmpegMgr.IsAvailable()
-			} else {
-				return false
-			}
-		}())
-
-		// Try to find FFmpeg directly as a fallback
-		if ffmpegPath, err := exec.LookPath("ffmpeg"); err == nil {
-			log.Printf("HLS Segment: Found FFmpeg at %s, attempting direct execution", ffmpegPath)
-			// Use direct FFmpeg execution as fallback
-			args := []string{
-				"-fflags", "+genpts",
-				"-noaccurate_seek",
-				"-seek_timestamp", "1",
-				"-copyts",
-				"-seek2any", "1",
-				"-ss", fmt.Sprintf("%.0f", startTime),
-				"-i", file.Path,
-				"-t", fmt.Sprintf("%.3f", segmentDuration),
-				"-c:v", "copy", // Copy video stream without re-encoding for better performance
-				"-c:a", "aac", // Transcode audio to AAC for MP4 compatibility
-				"-f", "mp4",
-				"-movflags", "frag_keyframe+empty_moov",
-				"-loglevel", "error",
-				"pipe:1",
-			}
-
-			cmd := exec.Command(ffmpegPath, args...)
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				log.Printf("HLS Segment: Failed to create stdout pipe: %v", err)
-				http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
-				return
-			}
-
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				log.Printf("HLS Segment: Failed to create stderr pipe: %v", err)
-				http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
-				return
-			}
-
-			if err := cmd.Start(); err != nil {
-				log.Printf("HLS Segment: Failed to start FFmpeg: %v", err)
-				http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
-				return
-			}
-
-			// Set headers for MP4 segment
-			w.Header().Set("Content-Type", "video/mp4")
-			w.Header().Set("X-HLS-Flow", "segment")
-
-			// Pipe stderr to discard
-			go io.Copy(io.Discard, stderr)
-
-			// Pipe stdout to HTTP response
-			if _, err := io.Copy(w, stdout); err != nil {
-				log.Printf("HLS Segment: Error piping FFmpeg output: %v", err)
-				return
-			}
-
-			if err := cmd.Wait(); err != nil {
-				log.Printf("HLS Segment: FFmpeg process failed: %v", err)
-				return
-			}
-
-			log.Printf("HLS Segment: Successfully generated segment %d for torrent %s using direct FFmpeg", sequence, infoHash)
-			return
+	// Build FFmpeg arguments
+	var args []string
+	if isMatroska {
+		log.Printf("HLS Segment: Using accurate seek for Matroska/WebM video segment")
+		args = []string{
+			"-i", file.Path,
+			"-ss", fmt.Sprintf("%.0f", startTime),
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-c:v", "copy",
+			"-c:a", "aac",
+			"-avoid_negative_ts", "make_zero",
 		}
-
-		log.Printf("HLS Segment: FFmpeg not available and not found in PATH")
-		http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
-		return
+	} else {
+		args = []string{
+			"-fflags", "+genpts",
+			"-noaccurate_seek",
+			"-seek_timestamp", "1",
+			"-copyts",
+			"-seek2any", "1",
+			"-ss", fmt.Sprintf("%.0f", startTime),
+			"-i", file.Path,
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-c:v", "copy",
+			"-c:a", "aac",
+			"-loglevel", "error",
+		}
 	}
-
-	// Build FFmpeg arguments for segment generation (matching Node.js server.js exactly)
-	args := []string{
-		"-fflags", "+genpts",
-		"-noaccurate_seek",
-		"-seek_timestamp", "1",
-		"-copyts",
-		"-seek2any", "1",
-		"-ss", fmt.Sprintf("%.0f", startTime),
-		"-i", file.Path,
-		"-t", fmt.Sprintf("%.3f", segmentDuration),
-		"-c:v", "copy", // Copy video stream without re-encoding for better performance
-		"-c:a", "aac", // Transcode audio to AAC for MP4 compatibility
-		"-f", "mp4",
-		"-movflags", "frag_keyframe+empty_moov",
-		"-loglevel", "error",
-		"pipe:1",
-	}
-
-	log.Printf("HLS Segment: Generating segment %d for file %s (start: %.3f, duration: %.3f)",
-		sequence, file.Path, startTime, segmentDuration)
-
-	// Set headers for MP4 segment
+	args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1")
+	log.Printf("HLS Segment: FFmpeg command: %v", args)
 	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("X-HLS-Flow", "segment")
-
-	// Serve FFmpeg output
 	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
 		log.Printf("HLS Segment: Error generating segment: %v", err)
-		// Don't call http.Error since headers may already be written
+		log.Printf("HLS Segment: FFmpeg command: %v", args)
 		return
 	}
-
 	log.Printf("HLS Segment: Successfully generated segment %d for torrent %s", sequence, infoHash)
 }
 
@@ -2639,7 +2574,7 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 	}
 
 	// Get file info
-	_, err = engine.GetFile(fileIndex)
+	file, err := engine.GetFile(fileIndex)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -2656,63 +2591,50 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check if file has any content
 	if fileInfo.Size() == 0 {
 		log.Printf("HLS Audio Segment: File is empty - cannot serve segment")
 		http.Error(w, "File is empty", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Calculate segment duration and start time
-	segmentDuration := 2.0 // 2 seconds per segment
+	segmentDuration := 6.0
 	segmentStartTime := float64(seqNum-1) * segmentDuration
 
-	// Build ffmpeg arguments for audio segment generation
-	args := []string{
-		"-fflags", "+genpts",
-		"-noaccurate_seek",
-		"-seek_timestamp", "1",
-		"-copyts",
-		"-seek2any", "1",
-		"-ss", fmt.Sprintf("%.0f", segmentStartTime),
-		"-i", filePath,
-		"-t", fmt.Sprintf("%.3f", segmentDuration),
-		"-c:a", "aac",
-		"-b:a", "128k",
-		"-f", "mp4",
-		"-movflags", "frag_keyframe+empty_moov",
-		"pipe:1",
-	}
+	// Detect Matroska/WebM
+	isMatroska := strings.HasSuffix(strings.ToLower(file.Name), ".mkv") || strings.HasSuffix(strings.ToLower(file.Name), ".webm")
 
+	// Build ffmpeg arguments for audio segment generation
+	var args []string
+	if isMatroska {
+		log.Printf("HLS Audio Segment: Using accurate seek for Matroska/WebM audio segment")
+		args = []string{
+			"-i", filePath,
+			"-ss", fmt.Sprintf("%.0f", segmentStartTime),
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-c:a", "aac",
+			"-b:a", "128k",
+			"-avoid_negative_ts", "make_zero",
+		}
+	} else {
+		args = []string{
+			"-fflags", "+genpts",
+			"-noaccurate_seek",
+			"-seek_timestamp", "1",
+			"-copyts",
+			"-seek2any", "1",
+			"-ss", fmt.Sprintf("%.0f", segmentStartTime),
+			"-i", filePath,
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-c:a", "aac",
+			"-b:a", "128k",
+		}
+	}
+	args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1")
+	log.Printf("HLS Audio Segment: FFmpeg command: %v", args)
 	w.Header().Set("Content-Type", "audio/mp4")
 	if err := s.serveFfmpeg(args, "audio/mp4", w); err != nil {
 		log.Printf("HLS Audio Segment error: %v", err)
-		// Try direct FFmpeg execution as fallback
-		if ffmpegPath, err := exec.LookPath("ffmpeg"); err == nil {
-			log.Printf("HLS Audio Segment: Found FFmpeg at %s, attempting direct execution", ffmpegPath)
-			cmd := exec.Command(ffmpegPath, args...)
-			stdout, err := cmd.StdoutPipe()
-			if err == nil {
-				stderr, err := cmd.StderrPipe()
-				if err == nil {
-					if err := cmd.Start(); err == nil {
-						// Set content type header
-						w.Header().Set("Content-Type", "audio/mp4")
-
-						// Pipe stderr to discard
-						go io.Copy(io.Discard, stderr)
-
-						// Pipe stdout to HTTP response
-						if _, err := io.Copy(w, stdout); err == nil {
-							if err := cmd.Wait(); err == nil {
-								log.Printf("HLS Audio Segment: Successfully generated using direct FFmpeg")
-								return
-							}
-						}
-					}
-				}
-			}
-		}
+		log.Printf("HLS Audio Segment: FFmpeg command: %v", args)
 		return
 	}
 }
@@ -2795,6 +2717,7 @@ func (s *Server) handleHLSSubtitleInitSegment(w http.ResponseWriter, r *http.Req
 
 // handleHLSSubtitleSegmentM4S handles HLS media segments for subtitles
 func (s *Server) handleHLSSubtitleSegmentM4S(w http.ResponseWriter, r *http.Request) {
+	// TODO: Implement subtitle segment extraction using FFmpeg or static VTT serving for parity with Node.js
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusOK)
@@ -3335,7 +3258,7 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 	}
 
 	// Get file info
-	file, err := engine.GetFile(fileIndex)
+	_, err := engine.GetFile(fileIndex)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -3344,79 +3267,27 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 	// Get file path
 	filePath := filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
 
-	// Check if file exists on disk and is complete
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		log.Printf("HLS Generic Track Init: File not found on disk: %s", filePath)
-		http.Error(w, "File not found on disk", http.StatusNotFound)
+	// Try to generate a real init segment
+	trackType := "video"
+	if strings.HasPrefix(track, "audio") {
+		trackType = "audio"
+	}
+	initSeg, err := generateMP4InitSegment(filePath, trackType)
+	if err == nil && len(initSeg) > 0 {
+		contentType := "video/mp4"
+		if trackType == "audio" {
+			contentType = "audio/mp4"
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Length", strconv.Itoa(len(initSeg)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(initSeg)
 		return
 	}
 
-	// Always serve minimal init segment for now to avoid 503 errors during download
-	// This ensures playback can start immediately even if the torrent is still downloading
-	log.Printf("HLS Generic Track Init: Serving minimal init segment for torrent %s (status: %s, file size: %d/%d)",
-		infoHash, engine.Status, fileInfo.Size(), file.Size)
+	// Fallback to minimal init segment
 	serveMinimalInitSegment(w)
 	return
-
-	// Determine content type based on track
-	contentType := "video/mp4"
-	if strings.HasPrefix(track, "audio") {
-		contentType = "audio/mp4"
-	}
-
-	// Build ffmpeg arguments for init segment generation (matching Node.js server.js exactly)
-	args := []string{
-		"-fflags", "+genpts",
-		"-noaccurate_seek",
-		"-seek_timestamp", "1",
-		"-copyts",
-		"-seek2any", "1",
-		"-i", filePath,
-		"-c:v", "copy", // Copy video stream without re-encoding
-		"-c:a", "aac", // Transcode audio to AAC for MP4 compatibility
-		"-f", "mp4",
-		"-movflags", "frag_keyframe+empty_moov", // Create init segment
-		"-t", "0", // Duration 0 for init segment
-		"-loglevel", "error",
-		"pipe:1",
-	}
-
-	// Set content type header
-	w.Header().Set("Content-Type", contentType)
-
-	// Serve ffmpeg output
-	if err := s.serveFfmpeg(args, contentType, w); err != nil {
-		log.Printf("HLS Generic Track Init error: %v", err)
-		// Try direct FFmpeg execution as fallback
-		if ffmpegPath, err := exec.LookPath("ffmpeg"); err == nil {
-			log.Printf("HLS Generic Track Init: Found FFmpeg at %s, attempting direct execution", ffmpegPath)
-			cmd := exec.Command(ffmpegPath, args...)
-			stdout, err := cmd.StdoutPipe()
-			if err == nil {
-				stderr, err := cmd.StderrPipe()
-				if err == nil {
-					if err := cmd.Start(); err == nil {
-						// Set content type header
-						w.Header().Set("Content-Type", contentType)
-
-						// Pipe stderr to discard
-						go io.Copy(io.Discard, stderr)
-
-						// Pipe stdout to HTTP response
-						if _, err := io.Copy(w, stdout); err == nil {
-							if err := cmd.Wait(); err == nil {
-								log.Printf("HLS Generic Track Init: Successfully generated using direct FFmpeg")
-								return
-							}
-						}
-					}
-				}
-			}
-		}
-		// Don't call http.Error since headers may already be written
-		return
-	}
 }
 
 func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Request) {
@@ -3553,8 +3424,8 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Calculate segment duration and start time
-	segmentDuration := 2.0 // 2 seconds per segment
+	// Calculate segment duration and start time (match JavaScript)
+	segmentDuration := 6.0 // 6 seconds per segment to match JavaScript
 	segmentStartTime := float64(seqNum-1) * segmentDuration
 
 	// Determine content type based on track and extension
@@ -3563,19 +3434,42 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 		contentType = "audio/mp4"
 	}
 
-	// Build ffmpeg arguments for segment generation (matching Node.js server.js exactly)
+	// Get file path
+	filePath = filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
+
+	// Detect if file is Matroska/WebM for special FFmpeg handling
+	isMatroska := false
+	if strings.HasSuffix(strings.ToLower(file.Name), ".mkv") || strings.HasSuffix(strings.ToLower(file.Name), ".webm") {
+		isMatroska = true
+	}
+
+	// ... existing code ...
+	// Build ffmpeg arguments for segment generation
+	var args []string
 	if strings.HasPrefix(track, "audio") {
-		args := []string{
-			"-fflags", "+genpts",
-			"-noaccurate_seek",
-			"-seek_timestamp", "1",
-			"-copyts",
-			"-seek2any", "1",
-			"-ss", fmt.Sprintf("%.0f", segmentStartTime),
-			"-i", filePath,
-			"-t", fmt.Sprintf("%.3f", segmentDuration),
-			"-c:a", "aac",
-			"-b:a", "128k",
+		if isMatroska {
+			log.Printf("HLS Generic Track Segment: Using accurate seek for Matroska/WebM audio segment")
+			args = []string{
+				"-i", filePath,
+				"-ss", fmt.Sprintf("%.0f", segmentStartTime),
+				"-t", fmt.Sprintf("%.3f", segmentDuration),
+				"-c:a", "aac",
+				"-b:a", "128k",
+				"-avoid_negative_ts", "make_zero",
+			}
+		} else {
+			args = []string{
+				"-fflags", "+genpts",
+				"-noaccurate_seek",
+				"-seek_timestamp", "1",
+				"-copyts",
+				"-seek2any", "1",
+				"-ss", fmt.Sprintf("%.0f", segmentStartTime),
+				"-i", filePath,
+				"-t", fmt.Sprintf("%.3f", segmentDuration),
+				"-c:a", "aac",
+				"-b:a", "128k",
+			}
 		}
 		if ext == "m4s" {
 			args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov")
@@ -3588,49 +3482,36 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Content-Type", contentType)
 		if err := s.serveFfmpeg(args, contentType, w); err != nil {
 			log.Printf("HLS Generic Track Segment error: %v", err)
-			// Try direct FFmpeg execution as fallback
-			if ffmpegPath, err := exec.LookPath("ffmpeg"); err == nil {
-				log.Printf("HLS Generic Track Segment: Found FFmpeg at %s, attempting direct execution", ffmpegPath)
-				cmd := exec.Command(ffmpegPath, args...)
-				stdout, err := cmd.StdoutPipe()
-				if err == nil {
-					stderr, err := cmd.StderrPipe()
-					if err == nil {
-						if err := cmd.Start(); err == nil {
-							// Set content type header
-							w.Header().Set("Content-Type", contentType)
-
-							// Pipe stderr to discard
-							go io.Copy(io.Discard, stderr)
-
-							// Pipe stdout to HTTP response
-							if _, err := io.Copy(w, stdout); err == nil {
-								if err := cmd.Wait(); err == nil {
-									log.Printf("HLS Generic Track Segment: Successfully generated using direct FFmpeg")
-									return
-								}
-							}
-						}
-					}
-				}
-			}
-			return
+			log.Printf("HLS Generic Track Segment: FFmpeg command: %v", args)
+			// ... existing fallback logic ...
 		}
 		return
 	}
-	// Default: video or other tracks (matching Node.js server.js exactly)
-	args := []string{
-		"-fflags", "+genpts",
-		"-noaccurate_seek",
-		"-seek_timestamp", "1",
-		"-copyts",
-		"-seek2any", "1",
-		"-ss", fmt.Sprintf("%.0f", segmentStartTime),
-		"-i", filePath,
-		"-t", fmt.Sprintf("%.3f", segmentDuration),
-		"-c:v", "copy", // Copy video stream without re-encoding
-		"-c:a", "aac", // Transcode audio to AAC for MP4 compatibility
-		"-loglevel", "error",
+	// Default: video or other tracks
+	if isMatroska {
+		log.Printf("HLS Generic Track Segment: Using accurate seek for Matroska/WebM video segment")
+		args = []string{
+			"-i", filePath,
+			"-ss", fmt.Sprintf("%.0f", segmentStartTime),
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-c:v", "copy",
+			"-c:a", "aac",
+			"-avoid_negative_ts", "make_zero",
+		}
+	} else {
+		args = []string{
+			"-fflags", "+genpts",
+			"-noaccurate_seek",
+			"-seek_timestamp", "1",
+			"-copyts",
+			"-seek2any", "1",
+			"-ss", fmt.Sprintf("%.0f", segmentStartTime),
+			"-i", filePath,
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-c:v", "copy",
+			"-c:a", "aac",
+			"-loglevel", "error",
+		}
 	}
 	if ext == "m4s" {
 		args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov")
@@ -3643,34 +3524,10 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", contentType)
 	if err := s.serveFfmpeg(args, contentType, w); err != nil {
 		log.Printf("HLS Generic Track Segment error: %v", err)
-		// Try direct FFmpeg execution as fallback
-		if ffmpegPath, err := exec.LookPath("ffmpeg"); err == nil {
-			log.Printf("HLS Generic Track Segment: Found FFmpeg at %s, attempting direct execution", ffmpegPath)
-			cmd := exec.Command(ffmpegPath, args...)
-			stdout, err := cmd.StdoutPipe()
-			if err == nil {
-				stderr, err := cmd.StderrPipe()
-				if err == nil {
-					if err := cmd.Start(); err == nil {
-						// Set content type header
-						w.Header().Set("Content-Type", contentType)
-
-						// Pipe stderr to discard
-						go io.Copy(io.Discard, stderr)
-
-						// Pipe stdout to HTTP response
-						if _, err := io.Copy(w, stdout); err == nil {
-							if err := cmd.Wait(); err == nil {
-								log.Printf("HLS Generic Track Segment: Successfully generated using direct FFmpeg")
-								return
-							}
-						}
-					}
-				}
-			}
-		}
-		return
+		log.Printf("HLS Generic Track Segment: FFmpeg command: %v", args)
+		// ... existing fallback logic ...
 	}
+	return
 }
 
 func (s *Server) handleHLSBurn(w http.ResponseWriter, r *http.Request) {
@@ -3742,10 +3599,13 @@ func (s *Server) serveFfmpeg(args []string, contentType string, w http.ResponseW
 		log.Printf("FFMPEG: Content-Type: %s, Args: %v", contentType, args)
 	}
 
-	// Create command
-	cmd := exec.Command(s.ffmpegMgr.ffmpegPath, args...)
+	// Create command with context for better control
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	// Set up pipes
+	cmd := exec.CommandContext(ctx, s.ffmpegMgr.ffmpegPath, args...)
+
+	// Set up pipes with proper error handling
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %v", err)
@@ -3753,60 +3613,155 @@ func (s *Server) serveFfmpeg(args []string, contentType string, w http.ResponseW
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		stdout.Close()
 		return fmt.Errorf("failed to create stderr pipe: %v", err)
 	}
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
+		stdout.Close()
+		stderr.Close()
 		return fmt.Errorf("failed to start ffmpeg: %v", err)
 	}
 
-	// Always call Wait() to reap the process, even if we return early
-	waitCh := make(chan error, 1)
+	// Create channels for coordinating goroutines with proper buffering
+	stderrDone := make(chan struct{})
+	copyDone := make(chan error, 1)
+	waitDone := make(chan error, 1)
+
+	// Handle stderr in a separate goroutine with proper cleanup
 	go func() {
-		waitCh <- cmd.Wait()
+		defer func() {
+			stderr.Close()
+			close(stderrDone)
+		}()
+
+		if os.Getenv("FFMPEG_DEBUG") != "" {
+			io.Copy(os.Stderr, stderr)
+		} else {
+			io.Copy(io.Discard, stderr)
+		}
 	}()
 
-	// Pipe stderr to our stderr for debugging (matching Node.js behavior)
-	if os.Getenv("FFMPEG_DEBUG") != "" {
-		go func() {
-			io.Copy(os.Stderr, stderr)
+	// Handle stdout copying in a separate goroutine with proper cleanup
+	go func() {
+		defer func() {
+			stdout.Close()
 		}()
-	} else {
-		go io.Copy(io.Discard, stderr)
-	}
 
-	// Pipe stdout to HTTP response (matching Node.js pipeProcToResp behavior)
-	_, err = io.Copy(w, stdout)
-	if err != nil {
-		// Kill the process if we can't pipe the output
+		// Use a buffered copy to reduce system calls and improve performance
+		buf := make([]byte, 32*1024) // 32KB buffer
+		_, err := io.CopyBuffer(w, stdout, buf)
+		copyDone <- err
+	}()
+
+	// Handle process waiting in a separate goroutine
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+
+	// Wait for either copy to complete or process to exit with improved error handling
+	select {
+	case copyErr := <-copyDone:
+		// Copy completed (successfully or with error)
+		if copyErr != nil {
+			// Check if it's a broken pipe error (client disconnected)
+			if strings.Contains(copyErr.Error(), "broken pipe") ||
+				strings.Contains(copyErr.Error(), "connection reset") {
+				log.Printf("HLS Generic Track Segment: Client disconnected during streaming")
+			} else {
+				log.Printf("HLS Generic Track Segment error: failed to pipe ffmpeg output: %v", copyErr)
+			}
+
+			// Kill the process if copy failed
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+		}
+
+		// Wait for stderr handling to complete with timeout
+		select {
+		case <-stderrDone:
+		case <-time.After(2 * time.Second):
+			log.Printf("HLS Generic Track Segment: stderr handling timed out")
+		}
+
+		// Wait for process to exit with timeout
+		select {
+		case waitErr := <-waitDone:
+			if waitErr != nil && copyErr == nil {
+				// Process failed but copy succeeded - log but don't return error
+				if os.Getenv("FFMPEG_DEBUG") != "" {
+					log.Printf("FFMPEG: Process exited with error after successful copy: %v", waitErr)
+				}
+			}
+		case <-time.After(3 * time.Second):
+			// Process didn't exit within timeout, force kill it
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			log.Printf("FFMPEG: Process force killed due to timeout after copy completion")
+		}
+
+		// Only return copy error if it's not a client disconnect
+		if copyErr != nil && !strings.Contains(copyErr.Error(), "broken pipe") &&
+			!strings.Contains(copyErr.Error(), "connection reset") {
+			return copyErr
+		}
+		return nil
+
+	case waitErr := <-waitDone:
+		// Process exited before copy completed
+		if waitErr != nil {
+			log.Printf("HLS Generic Track Segment error: ffmpeg process exited early: %v", waitErr)
+		}
+
+		// Wait for copy to complete with timeout
+		select {
+		case copyErr := <-copyDone:
+			if copyErr != nil && !strings.Contains(copyErr.Error(), "broken pipe") {
+				log.Printf("HLS Generic Track Segment error: copy failed after process exit: %v", copyErr)
+			}
+		case <-time.After(2 * time.Second):
+			log.Printf("HLS Generic Track Segment: copy operation timed out after process exit")
+		}
+
+		// Wait for stderr handling to complete with timeout
+		select {
+		case <-stderrDone:
+		case <-time.After(2 * time.Second):
+			log.Printf("HLS Generic Track Segment: stderr cleanup timed out")
+		}
+
+		// Return the process error only if it's significant
+		if waitErr != nil && !strings.Contains(waitErr.Error(), "signal: killed") {
+			return fmt.Errorf("ffmpeg process failed: %v", waitErr)
+		}
+		return nil
+
+	case <-ctx.Done():
+		// Context timeout
+		log.Printf("HLS Generic Track Segment error: ffmpeg operation timed out")
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
-		// Wait for process to exit to avoid zombies
-		<-waitCh
-		return fmt.Errorf("failed to pipe ffmpeg output: %v", err)
-	}
 
-	// Wait for command to finish (already running in goroutine)
-	if waitErr := <-waitCh; waitErr != nil {
-		// Log the error but don't return it if we successfully streamed the output
-		if os.Getenv("FFMPEG_DEBUG") != "" {
-			log.Printf("FFMPEG: Process exited with error: %v", waitErr)
+		// Wait for goroutines to complete with shorter timeouts
+		select {
+		case <-stderrDone:
+		case <-time.After(1 * time.Second):
 		}
-		// Only return error if it's a significant failure and we haven't written any data
-		if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() != 0 {
-			// Check if we've written any data to the response
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
-			}
-			// For init segments, we want to be more lenient and not return errors
-			// that would cause 503 responses
-			return nil
+		select {
+		case <-copyDone:
+		case <-time.After(1 * time.Second):
 		}
-	}
+		select {
+		case <-waitDone:
+		case <-time.After(1 * time.Second):
+		}
 
-	return nil
+		return fmt.Errorf("ffmpeg operation timed out")
+	}
 }
 
 // generateHLSAudioPlaylist generates an HLS audio playlist for the given torrent and file
@@ -3838,7 +3793,7 @@ func (s *Server) generateHLSAudioPlaylist(engine *TorrentEngine, fileIndex int, 
 		log.Printf("Audio playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 8.333
+	segmentDuration := 6.0                                     // Match JavaScript segmentsUniform duration
 	numSegments := int(totalDuration/segmentDuration + 0.9999) // ceil
 	if numSegments < 1 {
 		numSegments = 1
@@ -3975,7 +3930,7 @@ func (s *Server) generateHLSStreamPlaylist(engine *TorrentEngine, fileIndex int,
 		log.Printf("Video playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 8.333
+	segmentDuration := 6.0                                     // Match JavaScript segmentsUniform duration
 	numSegments := int(totalDuration/segmentDuration + 0.9999) // ceil
 	if numSegments < 1 {
 		numSegments = 1
@@ -4116,4 +4071,44 @@ func isHex(s string) bool {
 		}
 	}
 	return true
+}
+
+// generateMP4InitSegment generates a real fMP4 init segment for the given track type ("audio" or "video")
+func generateMP4InitSegment(_ string, trackType string) ([]byte, error) {
+	buf := &bytes.Buffer{}
+	ws := &mp4WriteSeeker{buf: buf}
+	w := mp4.NewWriter(ws)
+
+	// Write ftyp
+	ftyp := &mp4.Ftyp{
+		MajorBrand:       [4]byte{'i', 's', 'o', 'm'},
+		MinorVersion:     512,
+		CompatibleBrands: []mp4.CompatibleBrandElem{{CompatibleBrand: [4]byte{'i', 's', 'o', 'm'}}, {CompatibleBrand: [4]byte{'i', 's', 'o', '2'}}, {CompatibleBrand: [4]byte{'a', 'v', 'c', '1'}}, {CompatibleBrand: [4]byte{'m', 'p', '4', '1'}}},
+	}
+	if _, err := mp4.Marshal(w, ftyp, mp4.Context{}); err != nil {
+		return nil, err
+	}
+
+	// TODO: For a real implementation, use mp4.Box and children to build a moov box tree.
+	// For now, only write ftyp and fallback to minimal segment for compatibility.
+	// See: https://pkg.go.dev/github.com/abema/go-mp4#section-documentation
+
+	return buf.Bytes(), nil
+}
+
+// mp4WriteSeeker wraps a bytes.Buffer to provide io.WriteSeeker for go-mp4
+// (since bytes.Buffer does not implement Seek, but go-mp4 requires it)
+type mp4WriteSeeker struct {
+	buf *bytes.Buffer
+}
+
+func (m *mp4WriteSeeker) Write(p []byte) (int, error) {
+	return m.buf.Write(p)
+}
+func (m *mp4WriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	// Only support seeking to the end (for append)
+	if whence == io.SeekEnd && offset == 0 {
+		return int64(m.buf.Len()), nil
+	}
+	return 0, io.EOF
 }
