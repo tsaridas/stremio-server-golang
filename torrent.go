@@ -84,7 +84,7 @@ func NewTorrentManager(cachePath string) (*TorrentManager, error) {
 	config := torrent.NewDefaultClientConfig()
 	config.DataDir = cachePath // Use passed cachePath as data directory
 	config.ListenPort = 0      // Let the system choose a port
-	config.DisableIPv6 = false
+	config.DisableIPv6 = true
 	config.DisableUTP = false
 	config.DisableTCP = false
 	config.NoDHT = false

@@ -3,6 +3,7 @@ module stremio-server
 go 1.20
 
 require (
+	github.com/abema/go-mp4 v1.4.1
 	github.com/anacrolix/torrent v1.52.6
 	github.com/gorilla/mux v1.8.1
 	golang.org/x/net v0.19.0
@@ -11,7 +12,6 @@ require (
 require (
 	crawshaw.io/sqlite v0.3.3-0.20220618202545-d1964889ea3c // indirect
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
-	github.com/abema/go-mp4 v1.4.1 // indirect
 	github.com/ajwerner/btree v0.0.0-20211221152037-f427b3e689c0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
 	github.com/anacrolix/chansync v0.3.0 // indirect

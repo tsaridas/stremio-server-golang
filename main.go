@@ -3873,9 +3873,6 @@ func expandHomeDir(path string) string {
 func createAppDirectories(appPath string) error {
 	directories := []string{
 		appPath,
-		filepath.Join(appPath, "cache"),
-		filepath.Join(appPath, "hls"),
-		filepath.Join(appPath, "thumbnails"),
 	}
 
 	for _, dir := range directories {
@@ -4243,6 +4240,7 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-seek2any", "1",
 			"-ss", fmt.Sprintf("%.3f", segmentStartTime),
 			"-i", filePath,
+			"-t", fmt.Sprintf("%.3f", segmentDuration), // limit audio segment duration
 			"-threads", "3",
 			"-ss", fmt.Sprintf("%.3f", segmentStartTime),
 			"-output_ts_offset", fmt.Sprintf("%.3f", segmentStartTime),
@@ -4277,6 +4275,7 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-seek2any", "1",
 			"-ss", fmt.Sprintf("%.3f", segmentStartTime),
 			"-i", filePath,
+			"-t", fmt.Sprintf("%.3f", segmentDuration),
 			"-threads", "3",
 			"-max_muxing_queue_size", "2048",
 			"-ignore_unknown",
@@ -4477,7 +4476,7 @@ func (s *Server) generateHLSAudioPlaylist(engine *TorrentEngine, fileIndex int, 
 		log.Printf("Audio playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 8.008                                   // Match JavaScript segmentsUniform duration
+	segmentDuration := 2.0                                     // Match ffmpeg segment duration
 	numSegments := int(totalDuration/segmentDuration + 0.9999) // ceil
 	if numSegments < 1 {
 		numSegments = 1
@@ -4555,13 +4554,11 @@ func (s *Server) generateHLSSubtitlePlaylist(engine *TorrentEngine, fileIndex in
 	}
 
 	// Use 4.096-second segments for consistency
-	segmentDuration := 8.008
+	segmentDuration := 2.0 // Match ffmpeg segment duration
 	numSegments := int(totalDuration / segmentDuration)
 	if numSegments < 1 {
 		numSegments = 1
 	}
-
-	// Ensure we don't generate too many segments (cap at 1000)
 	if numSegments > 1000 {
 		numSegments = 1000
 	}
@@ -4614,7 +4611,7 @@ func (s *Server) generateHLSStreamPlaylist(engine *TorrentEngine, fileIndex int,
 		log.Printf("Video playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 8.008                                   // Match JavaScript segmentsUniform duration
+	segmentDuration := 2.0                                     // Match ffmpeg segment duration
 	numSegments := int(totalDuration/segmentDuration + 0.9999) // ceil
 	if numSegments < 1 {
 		numSegments = 1
