@@ -135,8 +135,8 @@ func NewTorrentManager(cachePath string) (*TorrentManager, error) {
 }
 
 // AddTorrent adds a new torrent to the manager
-func (tm *TorrentManager) AddTorrent(magnetURI string) (*TorrentEngine, error) {
-	return tm.AddTorrentWithConfig(magnetURI, nil, true, 50, 300)
+func (tm *TorrentManager) AddTorrent(magnetURI string, fileIndex int) (*TorrentEngine, error) {
+	return tm.AddTorrentWithConfig(magnetURI, nil, true, 50, 300, fileIndex)
 }
 
 // optimizeTorrentSettings applies performance optimizations to a torrent
@@ -154,8 +154,8 @@ func optimizeTorrentSettings(t *torrent.Torrent) {
 }
 
 // AddTorrentWithConfig adds a new torrent to the manager with custom configuration
-func (tm *TorrentManager) AddTorrentWithConfig(magnetURI string, trackers []string, dhtEnabled bool, minPeers, maxPeers int) (*TorrentEngine, error) {
-	return tm.AddTorrentWithFileIndex(magnetURI, trackers, dhtEnabled, minPeers, maxPeers, -1)
+func (tm *TorrentManager) AddTorrentWithConfig(magnetURI string, trackers []string, dhtEnabled bool, minPeers, maxPeers int, fileIndex int) (*TorrentEngine, error) {
+	return tm.AddTorrentWithFileIndex(magnetURI, trackers, dhtEnabled, minPeers, maxPeers, fileIndex)
 }
 
 // AddTorrentWithFileIndex adds a torrent and only downloads the selected file
@@ -196,8 +196,8 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 			default:
 				close(existingEngine.stopChan)
 			}
-			existingEngine.Torrent.Drop()
-			existingEngine.Torrent = nil
+			//existingEngine.Torrent.Drop()
+			//existingEngine.Torrent = nil
 		}
 	}
 	// Create magnet URI with custom trackers if provided
@@ -402,7 +402,7 @@ func (tm *TorrentManager) RemoveTorrent(infoHash string) error {
 		}
 		// Set torrent to nil to prevent panic in monitor goroutine
 		engine.mu.Lock()
-		engine.Torrent = nil
+		//engine.Torrent = nil
 		engine.mu.Unlock()
 	}
 
@@ -622,8 +622,8 @@ func (tm *TorrentManager) Close() error {
 			}
 			// Set torrent to nil to prevent panic in monitor goroutine
 			engine.mu.Lock()
-			engine.Torrent = nil
-			engine.mu.Unlock()
+			//engine.Torrent = nil
+			//engine.mu.Unlock()
 		}
 	}
 
@@ -665,6 +665,28 @@ type TorrentEngine struct {
 	TorrentInfo       *metainfo.Info // Store torrent info
 	MetadataFetched   bool           // Track if metadata was fetched
 	MetadataFetchedAt time.Time      // When metadata was fetched
+
+	// --- Persistent stats for finished torrents ---
+	LastPeers             int
+	LastUnchoked          int
+	LastQueued            int
+	LastUnique            int
+	LastConnectionTries   int
+	LastSwarmPaused       bool
+	LastSwarmConnections  int
+	LastSwarmSize         int
+	LastSelections        []map[string]interface{}
+	LastWires             []map[string]interface{}
+	LastSources           []map[string]interface{}
+	LastPeerSearchRunning bool
+	LastPeerSearchMin     int
+	LastPeerSearchMax     int
+	LastPeerSearchSources []string
+	LastClientID          string
+	LastDownloaded        int64
+	LastUploaded          int64
+	LastDownloadSpeed     int64
+	LastUploadSpeed       int64
 }
 
 // monitor continuously monitors the torrent status
@@ -850,6 +872,62 @@ func (e *TorrentEngine) updateStatus() {
 			e.logger.Warn("No peers found after 30 seconds")
 		}
 	}
+
+	// --- Persist all relevant stats for finished torrents ---
+	stats := e.Torrent.Stats()
+	e.LastPeers = stats.TotalPeers
+	e.LastUnchoked = stats.TotalPeers // Use actual unchoked if available
+	e.LastQueued = 0                  // Not available, set to 0 or track if possible
+	e.LastUnique = stats.TotalPeers   // Use actual unique if available
+	e.LastConnectionTries = 0         // Not available, set to 0 or track if possible
+	e.LastSwarmPaused = false         // Not available, set to false
+	e.LastSwarmConnections = stats.TotalPeers
+	e.LastSwarmSize = e.MaxPeers
+	// Selections: not tracked, set to empty array
+	e.LastSelections = []map[string]interface{}{}
+	// Wires: not tracked, set to nil
+	e.LastWires = nil
+	// Sources: build from trackers and DHT
+	var sources []map[string]interface{}
+	for _, trackerURL := range e.Trackers {
+		source := map[string]interface{}{
+			"numFound":     0,
+			"numFoundUniq": 0,
+			"numRequests":  4,
+			"url":          fmt.Sprintf("tracker:%s", trackerURL),
+			"lastStarted":  time.Now().Format(time.RFC3339),
+		}
+		sources = append(sources, source)
+	}
+	if e.DHTEnabled {
+		dhtSource := map[string]interface{}{
+			"numFound":     0,
+			"numFoundUniq": 0,
+			"numRequests":  1,
+			"url":          fmt.Sprintf("dht:%s", e.InfoHash),
+			"lastStarted":  time.Now().Format(time.RFC3339),
+		}
+		sources = append(sources, dhtSource)
+	}
+	e.LastSources = sources
+	// Peer search running: true if torrent is active
+	e.LastPeerSearchRunning = true
+	e.LastPeerSearchMin = e.MinPeers
+	e.LastPeerSearchMax = e.MaxPeers
+	var peerSearchSources []string
+	for _, trackerURL := range e.Trackers {
+		peerSearchSources = append(peerSearchSources, fmt.Sprintf("tracker:%s", trackerURL))
+	}
+	if e.DHTEnabled {
+		peerSearchSources = append(peerSearchSources, fmt.Sprintf("dht:%s", e.InfoHash))
+	}
+	e.LastPeerSearchSources = peerSearchSources
+	// Client ID: not available, set to static or track if possible
+	e.LastClientID = "-DE2110-4df3cbd12bd8"
+	e.LastDownloaded = e.Downloaded
+	e.LastUploaded = 0 // Not tracked, set to 0
+	e.LastDownloadSpeed = downloadSpeed
+	e.LastUploadSpeed = 0 // Not tracked, set to 0
 }
 
 // MoveFilesToIndexNames moves downloaded files from their original names to index-based names

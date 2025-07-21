@@ -24,6 +24,16 @@ type FFmpegManager struct {
 	ffprobePath string
 	config      *FFmpegConfig
 	mu          sync.RWMutex
+
+	probeCache   map[string]*ffprobeCacheEntry
+	probeCacheMu sync.Mutex
+}
+
+type ffprobeCacheEntry struct {
+	FileSize int64
+	Result   *ProbeResponse
+	Err      error
+	Time     time.Time
 }
 
 // FFmpegConfig holds FFmpeg configuration
@@ -154,6 +164,7 @@ func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 			ffmpegPath:  "",
 			ffprobePath: "",
 			config:      config,
+			probeCache:  make(map[string]*ffprobeCacheEntry),
 		}, nil
 	}
 
@@ -165,6 +176,7 @@ func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 			ffmpegPath:  ffmpegPath,
 			ffprobePath: "",
 			config:      config,
+			probeCache:  make(map[string]*ffprobeCacheEntry),
 		}, nil
 	}
 
@@ -172,6 +184,7 @@ func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 		ffmpegPath:  ffmpegPath,
 		ffprobePath: ffprobePath,
 		config:      config,
+		probeCache:  make(map[string]*ffprobeCacheEntry),
 	}
 
 	// Test FFmpeg installation (but don't fail if it doesn't work)
@@ -761,10 +774,22 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 	}
 
 	// Check if input file exists
-	if _, err := os.Stat(inputPath); err != nil {
+	stat, err := os.Stat(inputPath)
+	if err != nil {
 		log.Printf("Input file does not exist: %s, error: %v", inputPath, err)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
+	fileSize := stat.Size()
+
+	// Check cache
+	fm.probeCacheMu.Lock()
+	cacheEntry, ok := fm.probeCache[inputPath]
+	if ok && cacheEntry.FileSize == fileSize && time.Since(cacheEntry.Time) < 10*time.Minute {
+		fm.probeCacheMu.Unlock()
+		log.Printf("FFprobe cache hit for %s (size=%d)", inputPath, fileSize)
+		return cacheEntry.Result, cacheEntry.Err
+	}
+	fm.probeCacheMu.Unlock()
 
 	// Get raw ffprobe output with more detailed information
 	args := []string{
@@ -775,39 +800,28 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 		inputPath,
 	}
 
-	log.Printf("Running ffprobe: %s %v", fm.ffprobePath, args)
-
 	cmd := exec.CommandContext(ctx, fm.ffprobePath, args...)
 	output, err := cmd.Output()
 	if err != nil {
-		// Check if it's a timeout error
 		if ctx.Err() == context.DeadlineExceeded {
 			log.Printf("FFprobe timeout after %v for %s", timeout, inputPath)
 			return nil, fmt.Errorf("ffprobe timeout after %v", timeout)
 		}
-		// If ffprobe fails, try to get basic file information
 		log.Printf("FFprobe failed for %s: %v, attempting fallback", inputPath, err)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
-
-	log.Printf("FFprobe output length: %d bytes for %s", len(output), inputPath)
-	fmt.Printf("\n==== FFPROBE RAW OUTPUT for %s ===\n%s\n==== END FFPROBE RAW OUTPUT ===\n\n", inputPath, string(output))
 
 	// Parse the raw JSON output
 	var rawData map[string]interface{}
 	if err := json.Unmarshal(output, &rawData); err != nil {
 		log.Printf("Failed to parse ffprobe output for %s: %v, attempting fallback", inputPath, err)
-		log.Printf("Raw output: %s", string(output))
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 
-	// Check if we got any meaningful data
 	if len(rawData) == 0 {
 		log.Printf("FFprobe returned empty data for %s, attempting fallback", inputPath)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
-
-	log.Printf("FFprobe successful for %s, format: %v, streams: %d", inputPath, rawData["format"], len(rawData["streams"].([]interface{})))
 
 	// Transform to expected format
 	response := &ProbeResponse{
@@ -817,13 +831,10 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 	// Extract format information
 	if formatData, ok := rawData["format"].(map[string]interface{}); ok {
 		response.Format.Name = fm.extractFormatName(formatData)
-
-		// Try multiple methods to get duration
 		duration := fm.extractDuration(formatData)
 		if duration > 0 {
 			response.Format.Duration = duration
 		} else {
-			// If format doesn't have duration, try to calculate from streams
 			if streamsData, ok := rawData["streams"].([]interface{}); ok {
 				for _, streamData := range streamsData {
 					if stream, ok := streamData.(map[string]interface{}); ok {
@@ -838,11 +849,13 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 	}
 
 	// Extract streams information
+	streamTypes := make(map[string]int)
 	if streamsData, ok := rawData["streams"].([]interface{}); ok {
 		for i, streamData := range streamsData {
 			if stream, ok := streamData.(map[string]interface{}); ok {
 				probeStream := fm.transformStream(stream, i)
 				response.Streams = append(response.Streams, probeStream)
+				streamTypes[probeStream.Track]++
 			}
 		}
 	}
@@ -854,7 +867,6 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 				if fileSize, err := strconv.ParseInt(size, 10, 64); err == nil {
 					if bitRate, ok := formatData["bit_rate"].(string); ok {
 						if br, err := strconv.ParseInt(bitRate, 10, 64); err == nil && br > 0 {
-							// Calculate duration from file size and bitrate
 							response.Format.Duration = float64(fileSize*8) / float64(br)
 						}
 					}
@@ -863,11 +875,23 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 		}
 	}
 
-	// If we still don't have any meaningful data, use fallback
 	if response.Format.Duration == 0 && len(response.Streams) == 0 {
 		log.Printf("No meaningful data extracted from ffprobe for %s, using fallback", inputPath)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
+
+	// Log a concise summary
+	log.Printf("FFprobe: %s size=%d duration=%.2fs streams=%d [video=%d audio=%d subtitle=%d] format=%s", inputPath, fileSize, response.Format.Duration, len(response.Streams), streamTypes["video"], streamTypes["audio"], streamTypes["subtitle"], response.Format.Name)
+
+	// Store in cache
+	fm.probeCacheMu.Lock()
+	fm.probeCache[inputPath] = &ffprobeCacheEntry{
+		FileSize: fileSize,
+		Result:   response,
+		Err:      nil,
+		Time:     time.Now(),
+	}
+	fm.probeCacheMu.Unlock()
 
 	return response, nil
 }

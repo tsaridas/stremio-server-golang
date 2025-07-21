@@ -2,3 +2,6 @@
 *.txt
 *.log
 stremio-server
+server.out
+split_server.sh
+*.js
