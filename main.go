@@ -4491,9 +4491,10 @@ func (s *Server) generateHLSAudioPlaylist(engine *TorrentEngine, fileIndex int, 
 	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
 	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
-	// Use static relative path for mediaURL
-	mediaURL := "/hlsv2/" + engine.InfoHash + "/" + strconv.Itoa(fileIndex)
-	qs := "?mediaURL=" + url.QueryEscape(mediaURL)
+	qs := queryString
+	if qs != "" && qs[0] != '?' {
+		qs = "?" + qs
+	}
 
 	playlist.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"audio0/init.mp4%s\"\n", qs))
 
@@ -4553,7 +4554,6 @@ func (s *Server) generateHLSSubtitlePlaylist(engine *TorrentEngine, fileIndex in
 		log.Printf("Subtitle playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	// Use 4.096-second segments for consistency
 	segmentDuration := 2.0 // Match ffmpeg segment duration
 	numSegments := int(totalDuration / segmentDuration)
 	if numSegments < 1 {
@@ -4569,13 +4569,15 @@ func (s *Server) generateHLSSubtitlePlaylist(engine *TorrentEngine, fileIndex in
 	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
 	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
-	// Add initialization segment with relative URL
-	playlist.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"subtitle0/init.mp4%s\"\n", queryString))
+	qs := queryString
+	if qs != "" && qs[0] != '?' {
+		qs = "?" + qs
+	}
+	playlist.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"subtitle0/init.mp4%s\"\n", qs))
 
-	// Add media segments with relative URLs
 	for i := 1; i <= numSegments; i++ {
 		playlist.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segmentDuration))
-		playlist.WriteString(fmt.Sprintf("subtitle0/segment%d.m4s%s\n", i, queryString))
+		playlist.WriteString(fmt.Sprintf("subtitle0/segment%d.m4s%s\n", i, qs))
 	}
 
 	playlist.WriteString("#EXT-X-ENDLIST\n")
@@ -4626,10 +4628,10 @@ func (s *Server) generateHLSStreamPlaylist(engine *TorrentEngine, fileIndex int,
 	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
 	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
-	// Use static relative path for mediaURL
-	mediaURL := "/hlsv2/" + engine.InfoHash + "/" + strconv.Itoa(fileIndex)
-	qs := "?mediaURL=" + url.QueryEscape(mediaURL)
-
+	qs := queryString
+	if qs != "" && qs[0] != '?' {
+		qs = "?" + qs
+	}
 	playlist.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"video0/init.mp4%s\"\n", qs))
 
 	for i := 1; i <= numSegments; i++ {
@@ -4639,7 +4641,7 @@ func (s *Server) generateHLSStreamPlaylist(engine *TorrentEngine, fileIndex int,
 		if segEnd > totalDuration {
 			actualSegDuration = totalDuration - segStart
 			if actualSegDuration < 0.1 {
-				break // don't emit zero/negative segments
+				break
 			}
 		}
 		playlist.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", actualSegDuration))
