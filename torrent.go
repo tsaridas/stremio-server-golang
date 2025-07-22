@@ -51,17 +51,18 @@ func (tl *TorrentLogger) Warn(format string, args ...interface{}) {
 
 // TorrentManager manages all torrent operations
 type TorrentManager struct {
-	client    *torrent.Client
-	engines   map[string]*TorrentEngine
-	mu        sync.RWMutex
-	cachePath string
-	logger    *TorrentLogger
+	client            *torrent.Client
+	engines           map[string]*TorrentEngine
+	mu                sync.RWMutex
+	cachePath         string
+	logger            *TorrentLogger
+	keepTorrentsAlive bool
 }
 
 // NewTorrentManager creates a new torrent manager
-func NewTorrentManager(cachePath string) (*TorrentManager, error) {
+func NewTorrentManager(cachePath string, keepTorrentsAlive bool) (*TorrentManager, error) {
 	logger := NewTorrentLogger("MANAGER")
-	logger.Info("Initializing torrent manager with cache path: %s", cachePath)
+	logger.Info("Initializing torrent manager with cache path: %s, keepTorrentsAlive: %v", cachePath, keepTorrentsAlive)
 
 	// Set environment variables to reduce logging verbosity
 	if os.Getenv("TORRENT_LOGGER") == "" {
@@ -117,10 +118,11 @@ func NewTorrentManager(cachePath string) (*TorrentManager, error) {
 	logger.Info("Torrent client created successfully")
 
 	tm := &TorrentManager{
-		client:    client,
-		engines:   make(map[string]*TorrentEngine),
-		cachePath: cachePath,
-		logger:    logger,
+		client:            client,
+		engines:           make(map[string]*TorrentEngine),
+		cachePath:         cachePath,
+		logger:            logger,
+		keepTorrentsAlive: keepTorrentsAlive,
 	}
 
 	logger.Info("Torrent manager initialized with in-memory state only")
@@ -236,20 +238,25 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 	numFiles := len(t.Files())
 	logger.Info("Torrent has %d files, configuring file priorities for index %d", numFiles, fileIndex)
 
-	if fileIndex < 0 || fileIndex >= numFiles {
-		// If fileIndex is invalid, set all files to normal (legacy behavior)
-		logger.Info("Invalid file index %d, downloading all files", fileIndex)
+	// Determine if we should download all files or just a specific file
+	downloadAllFiles := fileIndex < 0 || fileIndex >= numFiles
+
+	if downloadAllFiles {
+		// Download all files when fileIndex is not defined (-1) or invalid
+		logger.Info("File index not defined or invalid (%d), downloading all %d files", fileIndex, numFiles)
 		for _, file := range t.Files() {
 			file.SetPriority(torrent.PiecePriorityNormal)
 		}
 	} else {
-		logger.Info("Setting priority for file %d only", fileIndex)
+		// Download only the specific file requested
+		logger.Info("File index %d specified, downloading only file %d: %s", fileIndex, fileIndex, t.Files()[fileIndex].DisplayPath())
 		for i, file := range t.Files() {
 			if i == fileIndex {
 				file.SetPriority(torrent.PiecePriorityNormal)
 				logger.Debug("File %d (%s) set to normal priority", i, file.DisplayPath())
 			} else {
 				file.SetPriority(torrent.PiecePriorityNone)
+				logger.Debug("File %d (%s) set to no priority (will not download)", i, file.DisplayPath())
 			}
 		}
 	}
@@ -258,25 +265,26 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 	logger.Info("Creating torrent engine for %s", infoHashStr)
 
 	engine := &TorrentEngine{
-		InfoHash:          infoHashStr,
-		Torrent:           t,
-		Files:             make([]TorrentFile, 0, len(t.Files())),
-		Status:            "starting",
-		Peers:             0,
-		Downloaded:        0,
-		TotalSize:         0,
-		CreatedAt:         time.Now(),
-		manager:           tm,
-		Trackers:          trackers,
-		DHTEnabled:        dhtEnabled,
-		MinPeers:          minPeers,
-		MaxPeers:          maxPeers,
-		stopChan:          make(chan struct{}),
-		TorrentName:       t.Info().Name,
-		TorrentInfo:       t.Info(),
-		MetadataFetched:   true,
-		MetadataFetchedAt: time.Now(),
-		logger:            NewTorrentLogger(infoHashStr[:8]),
+		InfoHash:           infoHashStr,
+		Torrent:            t,
+		Files:              make([]TorrentFile, 0, len(t.Files())),
+		Status:             "starting",
+		Peers:              0,
+		Downloaded:         0,
+		TotalSize:          0,
+		CreatedAt:          time.Now(),
+		manager:            tm,
+		Trackers:           trackers,
+		DHTEnabled:         dhtEnabled,
+		MinPeers:           minPeers,
+		MaxPeers:           maxPeers,
+		stopChan:           make(chan struct{}),
+		TorrentName:        t.Info().Name,
+		TorrentInfo:        t.Info(),
+		MetadataFetched:    true,
+		MetadataFetchedAt:  time.Now(),
+		RequestedFileIndex: fileIndex,
+		logger:             NewTorrentLogger(infoHashStr[:8]),
 	}
 	for i, file := range t.Files() {
 		tf := TorrentFile{
@@ -286,8 +294,14 @@ func (tm *TorrentManager) AddTorrentWithFileIndex(magnetURI string, trackers []s
 			Path:  filepath.Join(tm.cachePath, infoHashStr, strconv.Itoa(i)),
 		}
 		engine.Files = append(engine.Files, tf)
-		engine.TotalSize += file.Length()
-		logger.Debug("Added file %d: %s (size: %d bytes)", i, tf.Name, tf.Size)
+
+		// Only add to TotalSize if this file is being downloaded
+		if downloadAllFiles || i == fileIndex {
+			engine.TotalSize += file.Length()
+			logger.Debug("Added file %d: %s (size: %d bytes) - WILL DOWNLOAD", i, tf.Name, tf.Size)
+		} else {
+			logger.Debug("Added file %d: %s (size: %d bytes) - WILL NOT DOWNLOAD", i, tf.Name, tf.Size)
+		}
 	}
 
 	tm.engines[infoHashStr] = engine
@@ -659,6 +673,7 @@ type TorrentEngine struct {
 	stopChan           chan struct{}  // Channel to signal monitor goroutine to stop
 	lastLoggedProgress int            // Track last logged progress percentage to avoid duplicates
 	logger             *TorrentLogger // Logger for this torrent
+	RequestedFileIndex int            // The file index that was requested (-1 means all files)
 
 	// Persistent metadata - stored even after torrent is dropped
 	TorrentName       string         // Store torrent name
@@ -734,11 +749,17 @@ func (e *TorrentEngine) monitor() {
 				default:
 				}
 				if !closed && e.Torrent.Complete.Bool() {
-					if e.logger != nil {
-						e.logger.Info("Download complete, stopping torrent and DHT")
+					// Check if the requested files are complete
+					downloadInfo := "all files"
+					if e.RequestedFileIndex >= 0 {
+						downloadInfo = fmt.Sprintf("file %d", e.RequestedFileIndex)
 					}
 
-					// Persist file list and metadata before dropping torrent
+					if e.logger != nil {
+						e.logger.Info("Download complete for %s", downloadInfo)
+					}
+
+					// Persist file list and metadata before potentially dropping torrent
 					if e.Torrent != nil && e.Torrent.Info() != nil {
 						e.mu.Lock()
 						e.TorrentName = e.Torrent.Info().Name
@@ -764,14 +785,26 @@ func (e *TorrentEngine) monitor() {
 						}
 					}
 
-					// Stop DHT network
-					e.manager.DisableDHT()
-					// Stop the torrent safely
-					e.Torrent.Drop()
-					e.Torrent = nil // Set to nil to prevent future access
-					// Signal monitor to stop
-					close(e.stopChan)
-					return
+					// Check if we should keep the torrent alive
+					if e.manager.keepTorrentsAlive {
+						if e.logger != nil {
+							e.logger.Info("Keeping torrent alive after completion for %s (keepTorrentsAlive=true)", downloadInfo)
+						}
+						// Don't stop the torrent, just continue monitoring
+						continue
+					} else {
+						if e.logger != nil {
+							e.logger.Info("Stopping torrent and DHT after completion for %s (keepTorrentsAlive=false)", downloadInfo)
+						}
+						// Stop DHT network
+						e.manager.DisableDHT()
+						// Stop the torrent safely
+						e.Torrent.Drop()
+						e.Torrent = nil // Set to nil to prevent future access
+						// Signal monitor to stop
+						close(e.stopChan)
+						return
+					}
 				}
 			}
 
@@ -859,8 +892,14 @@ func (e *TorrentEngine) updateStatus() {
 			activePeers = stats.TotalPeers
 		}
 
-		e.logger.Info("%.1f%% complete | %d peers (%d active) | %.1f MB/s | %d/%d bytes | status: %s",
-			progress, e.Peers, activePeers, speedMBps, e.Downloaded, e.TotalSize, e.Status)
+		// Add information about which files are being downloaded
+		downloadInfo := "all files"
+		if e.RequestedFileIndex >= 0 {
+			downloadInfo = fmt.Sprintf("file %d only", e.RequestedFileIndex)
+		}
+
+		e.logger.Info("%.1f%% complete (%s) | %d peers (%d active) | %.1f MB/s | %d/%d bytes | status: %s",
+			progress, downloadInfo, e.Peers, activePeers, speedMBps, e.Downloaded, e.TotalSize, e.Status)
 
 		// Log warning if download speed is very low
 		if speedMBps < 0.1 && progress > 5 && e.Peers > 0 {

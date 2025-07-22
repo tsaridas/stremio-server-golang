@@ -30,11 +30,13 @@ func (a *Addon) GetRouter() *mux.Router {
 	return router
 }
 
+// handleManifest handles /manifest.json addon manifest requests
 func (a *Addon) handleManifest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(a.Manifest)
 }
 
+// handleResource handles /{resource}/{type}/{id} and /{resource}/{type}/{id}/{extra}.json addon resource requests
 func (a *Addon) handleResource(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	resource := vars["resource"]

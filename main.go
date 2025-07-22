@@ -31,14 +31,15 @@ import (
 
 // Config holds server configuration
 type Config struct {
-	HTTPPort  int
-	HTTPSPort int
-	AppPath   string
-	NoCORS    bool
-	Username  string
-	Password  string
-	FFmpeg    *FFmpegConfig
-	LogLevel  string
+	HTTPPort          int
+	HTTPSPort         int
+	AppPath           string
+	NoCORS            bool
+	Username          string
+	Password          string
+	FFmpeg            *FFmpegConfig
+	LogLevel          string
+	KeepTorrentsAlive bool
 }
 
 // EngineFS represents the torrent streaming engine
@@ -101,45 +102,45 @@ func (s *Server) setupRoutes() {
 	// Routes matching Node.js server.js exactly (in the same order)
 
 	// Basic routes
-	s.router.HandleFunc("/favicon.ico", s.handleFavicon).Methods("GET")
-	s.router.HandleFunc("/heartbeat", s.handleHeartbeat).Methods("GET")
-	s.router.HandleFunc("/status", s.handleStatus).Methods("GET")
+	s.router.HandleFunc("/favicon.ico", s.handleFavicon).Methods("GET") // handleFavicon handles /favicon.ico favicon requests
+	s.router.HandleFunc("/heartbeat", s.handleHeartbeat).Methods("GET") // handleHeartbeat handles /heartbeat heartbeat requests
+	s.router.HandleFunc("/status", s.handleStatus).Methods("GET")       // handleStatus handles /status server status
 
 	// Stats routes (matching Node.js exactly)
-	s.router.HandleFunc("/stats.json", s.handleGlobalStats).Methods("GET", "HEAD")
-	s.router.HandleFunc("/{infoHash}/stats.json", s.handleFileStats).Methods("GET", "HEAD")
-	s.router.HandleFunc("/{infoHash}/{fileIndex}/stats.json", s.handleFileStats).Methods("GET", "HEAD")
+	s.router.HandleFunc("/stats.json", s.handleGlobalStats).Methods("GET", "HEAD")                      // handleGlobalStats handles /stats.json global statistics
+	s.router.HandleFunc("/{infoHash}/stats.json", s.handleFileStats).Methods("GET", "HEAD")             // handleFileStats handles /{infoHash}/stats.json and /{infoHash}/{fileIndex}/stats.json file statistics
+	s.router.HandleFunc("/{infoHash}/{fileIndex}/stats.json", s.handleFileStats).Methods("GET", "HEAD") // handleFileStats handles /{infoHash}/stats.json and /{infoHash}/{fileIndex}/stats.json file statistics
 
 	// Torrent management routes (matching Node.js exactly)
-	// s.router.HandleFunc("/create", s.handleCreate).Methods("POST")
-	s.router.HandleFunc("/{infoHash}/create", s.handleCreateWithInfoHash).Methods("POST")
-	s.router.HandleFunc("/{infoHash}/remove", s.handleRemove).Methods("GET")
-	s.router.HandleFunc("/removeAll", s.handleRemoveAll).Methods("GET")
+	s.router.HandleFunc("/create", s.handleCreate).Methods("POST")                        // handleCreate handles /create torrent creation (commented out in router)
+	s.router.HandleFunc("/{infoHash}/create", s.handleCreateWithInfoHash).Methods("POST") // handleCreateWithInfoHash handles /{infoHash}/create torrent creation
+	s.router.HandleFunc("/{infoHash}/remove", s.handleRemove).Methods("GET")              // handleRemove handles /{infoHash}/remove torrent removal
+	s.router.HandleFunc("/removeAll", s.handleRemoveAll).Methods("GET")                   // handleRemoveAll handles /removeAll torrent removal
 
 	// Main streaming routes moved to after HLS routes to avoid conflicts
 
 	// Probe and media info routes (matching Node.js exactly)
-	s.router.HandleFunc("/probe", s.handleProbe).Methods("GET", "HEAD")
+	s.router.HandleFunc("/probe", s.handleProbe).Methods("GET", "HEAD") // handleProbe handles /probe media probing requests
 
 	// Utility routes (matching Node.js exactly)
-	s.router.HandleFunc("/stream", s.handleStreamProxy).Methods("GET")
-	s.router.HandleFunc("/get-https", s.handleGetHttps).Methods("GET")
-	s.router.HandleFunc("/tracks/{url:.*}", s.handleTracks).Methods("GET")
-	s.router.HandleFunc("/yt/{id}.json", s.handleYoutubeJson).Methods("GET")
-	s.router.HandleFunc("/yt/{id}", s.handleYoutube).Methods("GET")
-	s.router.HandleFunc("/subtitles.{ext}", s.handleSubtitlesExt).Methods("GET")
-	s.router.HandleFunc("/subtitles", s.handleSubtitles).Methods("GET")
-	s.router.HandleFunc("/subtitlesTracks", s.handleSubtitlesTracks).Methods("GET")
-	s.router.HandleFunc("/subtitles.vtt", s.handleSubtitlesVTT).Methods("GET")
-	s.router.HandleFunc("/opensubHash", s.handleOpenSubHash).Methods("GET")
-	s.router.HandleFunc("/casting", s.handleCasting).Methods("GET")
-	s.router.PathPrefix("/local-addon").Handler(http.StripPrefix("/local-addon", s.handleLocalAddon()))
+	s.router.HandleFunc("/stream", s.handleStreamProxy).Methods("GET")                                  // handleStreamProxy handles /stream proxy requests
+	s.router.HandleFunc("/get-https", s.handleGetHttps).Methods("GET")                                  // handleGetHttps handles /get-https HTTPS proxy requests
+	s.router.HandleFunc("/tracks/{url:.*}", s.handleTracks).Methods("GET")                              // handleTracks handles /tracks/{url:.*} track requests
+	s.router.HandleFunc("/yt/{id}.json", s.handleYoutubeJson).Methods("GET")                            // handleYoutubeJson handles /yt/{id}.json YouTube JSON requests
+	s.router.HandleFunc("/yt/{id}", s.handleYoutube).Methods("GET")                                     // handleYoutube handles /yt/{id} YouTube requests
+	s.router.HandleFunc("/subtitles.{ext}", s.handleSubtitlesExt).Methods("GET")                        // handleSubtitlesExt handles /subtitles.{ext} subtitle requests with extension
+	s.router.HandleFunc("/subtitles", s.handleSubtitles).Methods("GET")                                 // handleSubtitles handles /subtitles subtitle requests
+	s.router.HandleFunc("/subtitlesTracks", s.handleSubtitlesTracks).Methods("GET")                     // handleSubtitlesTracks handles /subtitlesTracks subtitle track requests
+	s.router.HandleFunc("/subtitles.vtt", s.handleSubtitlesVTT).Methods("GET")                          // handleSubtitlesVTT handles /subtitles.vtt VTT subtitle requests
+	s.router.HandleFunc("/opensubHash", s.handleOpenSubHash).Methods("GET")                             // handleOpenSubHash handles /opensubHash OpenSubtitles hash requests
+	s.router.HandleFunc("/casting", s.handleCasting).Methods("GET")                                     // handleCasting handles /casting casting requests
+	s.router.PathPrefix("/local-addon").Handler(http.StripPrefix("/local-addon", s.handleLocalAddon())) // handleLocalAddon handles /local-addon/* local addon requests
 
 	// Settings and info routes (matching Node.js exactly)
-	s.router.HandleFunc("/settings", s.handleSettings).Methods("GET", "POST")
-	s.router.HandleFunc("/network-info", s.handleNetworkInfo).Methods("GET")
-	s.router.HandleFunc("/device-info", s.handleDeviceInfo).Methods("GET")
-	s.router.HandleFunc("/hwaccel-profiler", s.handleHardwareAccelProfiler).Methods("GET")
+	s.router.HandleFunc("/settings", s.handleSettings).Methods("GET", "POST")              // handleSettings handles /settings server settings
+	s.router.HandleFunc("/network-info", s.handleNetworkInfo).Methods("GET")               // handleNetworkInfo handles /network-info network information
+	s.router.HandleFunc("/device-info", s.handleDeviceInfo).Methods("GET")                 // handleDeviceInfo handles /device-info device information
+	s.router.HandleFunc("/hwaccel-profiler", s.handleHardwareAccelProfiler).Methods("GET") // handleHardwareAccelProfiler handles /hwaccel-profiler hardware acceleration profiling
 
 	// HLS routes (matching Node.js server.js exactly)
 	// Main HLS routes - these must come BEFORE the parameterized routes
@@ -147,85 +148,85 @@ func (s *Server) setupRoutes() {
 		log.Printf("Test endpoint called!")
 		w.Write([]byte("Test OK"))
 	}).Methods("GET")
-	s.router.HandleFunc("/hlsv2/probe", s.handleHLSProbe).Methods("GET")
+	s.router.HandleFunc("/hlsv2/probe", s.handleHLSProbe).Methods("GET") // handleHLSProbe handles /hlsv2/probe HLS probing requests (matching server.js behavior)
 	s.router.HandleFunc("/hlsv2/probe-debug", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("HLS Probe Debug: Function called!")
 		w.Write([]byte("HLS Probe Debug OK"))
 	}).Methods("GET")
-	s.router.HandleFunc("/hlsv2/status", s.handleHLSStatus).Methods("GET")
-	s.router.HandleFunc("/hlsv2/exec", s.handleHLSExec).Methods("GET")
+	s.router.HandleFunc("/hlsv2/status", s.handleHLSStatus).Methods("GET") // handleHLSStatus handles /hlsv2/status HLS status requests
+	s.router.HandleFunc("/hlsv2/exec", s.handleHLSExec).Methods("GET")     // handleHLSExec handles /hlsv2/exec HLS exec requests
 
 	// HLS master playlist routes (matching Node.js exactly) - must come before generic routes
-	s.router.HandleFunc("/hlsv2/{infoHash}/master.m3u8", s.handleHLSMaster).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/master.m3u8", s.handleHLSMaster).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/master.m3u8", s.handleHLSMaster).Methods("GET", "HEAD")             // handleHLSMaster handles /hlsv2/{infoHash}/master.m3u8 and /hlsv2/{infoHash}/{fileIndex}/master.m3u8 HLS master playlists
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/master.m3u8", s.handleHLSMaster).Methods("GET", "HEAD") // handleHLSMaster handles /hlsv2/{infoHash}/master.m3u8 and /hlsv2/{infoHash}/{fileIndex}/master.m3u8 HLS master playlists
 
 	// HLS track routes without fileIndex (matching Node.js exactly) - must come before generic routes
-	s.router.HandleFunc("/hlsv2/{infoHash:[0-9a-fA-F]{32,40}|file|url}/video0.m3u8", s.handleHLSVideo0M3U8).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash:[0-9a-fA-F]{32,40}|file|url}/audio0.m3u8", s.handleHLSAudio0M3U8).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash:[0-9a-fA-F]{32,40}|file|url}/subtitle0.m3u8", s.handleHLSSubtitleM3U8).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash:[0-9a-fA-F]{32,40}|file|url}/video0.m3u8", s.handleHLSVideo0M3U8).Methods("GET", "HEAD")      // handleHLSVideo0M3U8 handles /hlsv2/{infoHash}/video0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/video0.m3u8 HLS video playlists
+	s.router.HandleFunc("/hlsv2/{infoHash:[0-9a-fA-F]{32,40}|file|url}/audio0.m3u8", s.handleHLSAudio0M3U8).Methods("GET", "HEAD")      // handleHLSAudio0M3U8 handles /hlsv2/{infoHash}/audio0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/audio0.m3u8 HLS audio playlists
+	s.router.HandleFunc("/hlsv2/{infoHash:[0-9a-fA-F]{32,40}|file|url}/subtitle0.m3u8", s.handleHLSSubtitleM3U8).Methods("GET", "HEAD") // handleHLSSubtitleM3U8 handles /hlsv2/{infoHash}/subtitle0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/subtitle0.m3u8 HLS subtitle playlists
 
 	// HLS audio init segment route (specific) - must come before generic routes
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4", s.handleHLSAudioInitSegment).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4", s.handleHLSAudioInitSegment).Methods("GET", "HEAD") // handleHLSAudioInitSegment handles /hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4 HLS audio init segments
 
 	// Generic HLSv2 routes (matching Node.js exactly) - must come after specific routes
-	s.router.HandleFunc("/hlsv2/{id}/{track}.m3u8", s.handleHLSGenericTrackM3U8).Methods("GET")
-	s.router.HandleFunc("/hlsv2/{id}/{track}/init.mp4", s.handleHLSGenericTrackInitMP4).Methods("GET")
-	s.router.HandleFunc("/hlsv2/{id}/{track}/segment{sequenceNumber}.{ext}", s.handleHLSGenericTrackSegment).Methods("GET")
+	s.router.HandleFunc("/hlsv2/{id}/{track}.m3u8", s.handleHLSGenericTrackM3U8).Methods("GET")                             // handleHLSGenericTrackM3U8 handles /hlsv2/{id}/{track}.m3u8 generic HLS track playlists
+	s.router.HandleFunc("/hlsv2/{id}/{track}/init.mp4", s.handleHLSGenericTrackInitMP4).Methods("GET")                      // handleHLSGenericTrackInitMP4 handles /hlsv2/{id}/{track}/init.mp4 generic HLS track init segments
+	s.router.HandleFunc("/hlsv2/{id}/{track}/segment{sequenceNumber}.{ext}", s.handleHLSGenericTrackSegment).Methods("GET") // handleHLSGenericTrackSegment handles /hlsv2/{id}/{track}/segment{sequenceNumber}.{ext} generic HLS track segments
 
 	// Utility HLSv2 routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{id}/burn", s.handleHLSBurn).Methods("GET")
-	s.router.HandleFunc("/hlsv2/{id}/destroy", s.handleHLSDestroy).Methods("GET")
+	s.router.HandleFunc("/hlsv2/{id}/burn", s.handleHLSBurn).Methods("GET")       // handleHLSBurn handles /hlsv2/{id}/burn HLS burn requests
+	s.router.HandleFunc("/hlsv2/{id}/destroy", s.handleHLSDestroy).Methods("GET") // handleHLSDestroy handles /hlsv2/{id}/destroy HLS destroy requests
 
 	// HLS stream playlist routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream.m3u8", s.handleHLSStream).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream.m3u8", s.handleHLSStream).Methods("GET", "HEAD") // handleHLSStream handles /hlsv2/{infoHash}/{fileIndex}/stream.m3u8 HLS stream playlists
 
 	// HLS segment routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/init.mp4", s.handleHLSInitSegmentNoFileIndex).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/init.mp4", s.handleHLSInitSegment).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/segment{sequence}.m4s", s.handleHLSSegmentM4S).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/segment{sequence}.m4s", s.handleHLSSegmentM4S).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/init.mp4", s.handleHLSInitSegmentNoFileIndex).Methods("GET", "HEAD")              // handleHLSInitSegmentNoFileIndex handles /hlsv2/{infoHash}/init.mp4 HLS init segments without file index
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/init.mp4", s.handleHLSInitSegment).Methods("GET", "HEAD")             // handleHLSInitSegment handles /hlsv2/{infoHash}/{fileIndex}/init.mp4 and /hlsv2/{infoHash}/{fileIndex}/video0/init.mp4 HLS init segments
+	s.router.HandleFunc("/hlsv2/{infoHash}/segment{sequence}.m4s", s.handleHLSSegmentM4S).Methods("GET", "HEAD")             // handleHLSSegmentM4S handles /hlsv2/{infoHash}/segment{sequence}.m4s and /hlsv2/{infoHash}/{fileIndex}/segment{sequence}.m4s HLS M4S segments
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/segment{sequence}.m4s", s.handleHLSSegmentM4S).Methods("GET", "HEAD") // handleHLSSegmentM4S handles /hlsv2/{infoHash}/segment{sequence}.m4s and /hlsv2/{infoHash}/{fileIndex}/segment{sequence}.m4s HLS M4S segments
 
 	// HLS quality-specific routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}.m3u8", s.handleHLSQuality).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/{seg}.ts", s.handleHLSSegment).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}.m3u8", s.handleHLSQuality).Methods("GET", "HEAD")     // handleHLSQuality handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}.m3u8 HLS quality playlists
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/{seg}.ts", s.handleHLSSegment).Methods("GET", "HEAD") // handleHLSSegment handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/{seg}.ts HLS segments
 
 	// New HLS routes with ffmpeg transcoding/splitting (similar to server.js)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/transcode/{seg}.ts", s.handleHLSSegmentTranscode).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/split.m3u8", s.handleHLSStreamSplit).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/transcode/{seg}.ts", s.handleHLSSegmentTranscode).Methods("GET", "HEAD") // handleHLSSegmentTranscode handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/transcode/{seg}.ts HLS transcoded segments
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/split.m3u8", s.handleHLSStreamSplit).Methods("GET", "HEAD")              // handleHLSStreamSplit handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/split.m3u8 HLS stream split playlists
 
 	// HLS audio routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0.m3u8", s.handleHLSAudio0M3U8).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4", s.handleHLSAudioInitSegment).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0/segment{sequence}.m4s", s.handleHLSAudioSegmentM4S).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0.m3u8", s.handleHLSAudio0M3U8).Methods("GET", "HEAD")                       // handleHLSAudio0M3U8 handles /hlsv2/{infoHash}/audio0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/audio0.m3u8 HLS audio playlists
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4", s.handleHLSAudioInitSegment).Methods("GET", "HEAD")             // handleHLSAudioInitSegment handles /hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4 HLS audio init segments
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/audio0/segment{sequence}.m4s", s.handleHLSAudioSegmentM4S).Methods("GET", "HEAD") // handleHLSAudioSegmentM4S handles /hlsv2/{infoHash}/{fileIndex}/audio0/segment{sequence}.m4s HLS audio M4S segments
 
 	// HLS subtitle routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/subtitle0.m3u8", s.handleHLSSubtitleM3U8).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/subtitle0/init.mp4", s.handleHLSSubtitleInitSegment).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/subtitle0/segment{sequence}.m4s", s.handleHLSSubtitleSegmentM4S).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/subtitle0.m3u8", s.handleHLSSubtitleM3U8).Methods("GET", "HEAD")                        // handleHLSSubtitleM3U8 handles /hlsv2/{infoHash}/subtitle0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/subtitle0.m3u8 HLS subtitle playlists
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/subtitle0/init.mp4", s.handleHLSSubtitleInitSegment).Methods("GET", "HEAD")             // handleHLSSubtitleInitSegment handles /hlsv2/{infoHash}/{fileIndex}/subtitle0/init.mp4 HLS subtitle init segments
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/subtitle0/segment{sequence}.m4s", s.handleHLSSubtitleSegmentM4S).Methods("GET", "HEAD") // handleHLSSubtitleSegmentM4S handles /hlsv2/{infoHash}/{fileIndex}/subtitle0/segment{sequence}.m4s HLS subtitle M4S segments
 
 	// HLS video routes (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/video0.m3u8", s.handleHLSVideo0M3U8).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/video0/init.mp4", s.handleHLSInitSegment).Methods("GET", "HEAD")
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/video0/segment{sequence}.m4s", s.handleHLSSegmentM4S).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/video0.m3u8", s.handleHLSVideo0M3U8).Methods("GET", "HEAD")                  // handleHLSVideo0M3U8 handles /hlsv2/{infoHash}/video0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/video0.m3u8 HLS video playlists
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/video0/init.mp4", s.handleHLSInitSegment).Methods("GET", "HEAD")             // handleHLSInitSegment handles /hlsv2/{infoHash}/{fileIndex}/init.mp4 and /hlsv2/{infoHash}/{fileIndex}/video0/init.mp4 HLS init segments
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/video0/segment{sequence}.m4s", s.handleHLSSegmentM4S).Methods("GET", "HEAD") // handleHLSSegmentM4S handles /hlsv2/{infoHash}/segment{sequence}.m4s and /hlsv2/{infoHash}/{fileIndex}/segment{sequence}.m4s HLS M4S segments
 
 	// Thumbnail route (matching Node.js exactly)
-	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/thumb.jpg", s.handleThumbnail).Methods("GET", "HEAD")
+	s.router.HandleFunc("/hlsv2/{infoHash}/{fileIndex}/thumb.jpg", s.handleThumbnail).Methods("GET", "HEAD") // handleThumbnail handles /hlsv2/{infoHash}/{fileIndex}/thumb.jpg thumbnail requests
 
 	// Transcode route (matching Node.js exactly)
-	s.router.HandleFunc("/transcode", s.handleTranscode).Methods("GET", "HEAD")
+	s.router.HandleFunc("/transcode", s.handleTranscode).Methods("GET", "HEAD") // handleTranscode handles /transcode video transcoding requests
 
 	// WebSocket route (matching Node.js exactly)
-	s.router.Handle("/ws", websocket.Handler(s.handleWebSocket))
+	s.router.Handle("/ws", websocket.Handler(s.handleWebSocket)) // handleWebSocket handles /ws WebSocket connections
 
 	// List route (matching Node.js exactly)
-	s.router.HandleFunc("/list", s.handleList).Methods("GET")
+	s.router.HandleFunc("/list", s.handleList).Methods("GET") // handleList handles /list torrent listing
 
 	// Proxy routes
-	s.router.HandleFunc("/proxy", s.handleProxy).Methods("GET", "POST")
+	s.router.HandleFunc("/proxy", s.handleProxy).Methods("GET", "POST") // handleProxy handles /proxy proxy requests
 
 	// Main streaming routes (matching Node.js exactly) - moved here to avoid conflicts with HLS routes
-	s.router.HandleFunc("/{infoHash}/{fileIndex}", s.handleStream).Methods("GET", "HEAD")
-	s.router.HandleFunc("/{infoHash}/{fileIndex}/{path:.*}", s.handleStream).Methods("GET", "HEAD")
+	s.router.HandleFunc("/{infoHash}/{fileIndex}", s.handleStream).Methods("GET", "HEAD")           // handleStream handles /{infoHash}/{fileIndex} and /{infoHash}/{fileIndex}/{path:.*} torrent file streaming
+	s.router.HandleFunc("/{infoHash}/{fileIndex}/{path:.*}", s.handleStream).Methods("GET", "HEAD") // handleStream handles /{infoHash}/{fileIndex} and /{infoHash}/{fileIndex}/{path:.*} torrent file streaming
 
 	// Debug route to catch unmatched requests
 	s.router.HandleFunc("/debug/{path:.*}", func(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +292,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// handleStream handles torrent file streaming
+// handleStream handles /{infoHash}/{fileIndex} and /{infoHash}/{fileIndex}/{path:.*} torrent file streaming
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -379,7 +380,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleFileStats returns detailed statistics for a specific file in a torrent
+// handleFileStats handles /{infoHash}/stats.json and /{infoHash}/{fileIndex}/stats.json file statistics
 func (s *Server) handleFileStats(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -1127,6 +1128,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 					"type":  "checkbox",
 				},
 				{
+					"id":    "keepTorrentsAlive",
+					"label": "KEEP_TORRENTS_ALIVE_AFTER_COMPLETION",
+					"type":  "checkbox",
+				},
+				{
 					"id":         "remoteHttps",
 					"label":      "ENABLE_REMOTE_HTTPS_CONN",
 					"type":       "select",
@@ -1162,6 +1168,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"btMinPeersForStable":       10,
 				"remoteHttps":               "",
 				"localAddonEnabled":         false,
+				"keepTorrentsAlive":         s.config.KeepTorrentsAlive,
 				"transcodeHorsepower":       s.config.FFmpeg.TranscodeHorsepower,
 				"transcodeMaxBitRate":       s.config.FFmpeg.TranscodeMaxBitRate,
 				"transcodeConcurrency":      s.config.FFmpeg.TranscodeConcurrency,
@@ -1838,7 +1845,7 @@ func (s *Server) generateBasicHLSMasterPlaylist(engine *TorrentEngine, queryStri
 /hlsv2/%s/video0.m3u8%s`, engine.InfoHash, queryString, engine.InfoHash, queryString)
 }
 
-// handleHLSStream handles HLS stream playlist
+// handleHLSStream handles /hlsv2/{infoHash}/{fileIndex}/stream.m3u8 HLS stream playlists
 func (s *Server) handleHLSStream(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -1920,7 +1927,7 @@ func (s *Server) handleHLSStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleHLSQuality handles HLS quality-specific playlists
+// handleHLSQuality handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}.m3u8 HLS quality playlists
 func (s *Server) handleHLSQuality(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -1962,7 +1969,7 @@ func (s *Server) handleHLSQuality(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(playlist))
 }
 
-// handleHLSSegment handles HLS segment serving
+// handleHLSSegment handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/{seg}.ts HLS segments
 func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -2007,7 +2014,7 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, segmentPath)
 }
 
-// handleHardwareAccelProfiler handles hardware acceleration profiling (matching Node.js server.js behavior)
+// handleHardwareAccelProfiler handles /hwaccel-profiler hardware acceleration profiling
 func (s *Server) handleHardwareAccelProfiler(w http.ResponseWriter, r *http.Request) {
 	if s.ffmpegMgr == nil || !s.ffmpegMgr.IsAvailable() {
 		http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
@@ -2020,7 +2027,7 @@ func (s *Server) handleHardwareAccelProfiler(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(info)
 }
 
-// handleTranscode handles video transcoding requests (matching Node.js server.js behavior)
+// handleTranscode handles /transcode video transcoding requests
 func (s *Server) handleTranscode(w http.ResponseWriter, r *http.Request) {
 	if s.ffmpegMgr == nil || !s.ffmpegMgr.IsAvailable() {
 		http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
@@ -2069,6 +2076,7 @@ func isFallbackProbe(probeInfo *ProbeResponse) bool {
 	return probeInfo == nil || (probeInfo.Format.Name == "unknown" && probeInfo.Format.Duration == 0 && len(probeInfo.Streams) == 0)
 }
 
+// handleProbe handles /probe media probing requests
 func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	if s.ffmpegMgr == nil || !s.ffmpegMgr.IsProbeAvailable() {
 		w.Header().Set("Content-Type", "application/json")
@@ -2170,7 +2178,7 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleThumbnail handles thumbnail requests (matching Node.js server.js behavior)
+// handleThumbnail handles /hlsv2/{infoHash}/{fileIndex}/thumb.jpg thumbnail requests
 func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	if s.ffmpegMgr == nil || !s.ffmpegMgr.IsAvailable() {
 		http.Error(w, "FFmpeg not available", http.StatusServiceUnavailable)
@@ -2216,7 +2224,7 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, thumbnailPath)
 }
 
-// handleWebSocket handles WebSocket connections
+// handleWebSocket handles /ws WebSocket connections
 func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	defer ws.Close()
 
@@ -2235,7 +2243,7 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	}
 }
 
-// handleHLSVideo0M3U8 handles the /hlsv2/{infoHash}/video0.m3u8 route
+// handleHLSVideo0M3U8 handles /hlsv2/{infoHash}/video0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/video0.m3u8 HLS video playlists
 func (s *Server) handleHLSVideo0M3U8(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -2274,7 +2282,7 @@ func (s *Server) handleHLSVideo0M3U8(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(playlist))
 }
 
-// handleHLSInitSegment handles the initialization segment for HLS
+// handleHLSInitSegment handles /hlsv2/{infoHash}/{fileIndex}/init.mp4 and /hlsv2/{infoHash}/{fileIndex}/video0/init.mp4 HLS init segments
 func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -2466,7 +2474,7 @@ func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleHLSInitSegmentNoFileIndex handles the initialization segment for HLS without fileIndex
+// handleHLSInitSegmentNoFileIndex handles /hlsv2/{infoHash}/init.mp4 HLS init segments without file index
 func (s *Server) handleHLSInitSegmentNoFileIndex(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], "")
@@ -2637,7 +2645,7 @@ func (s *Server) handleHLSInitSegmentNoFileIndex(w http.ResponseWriter, r *http.
 	}
 }
 
-// handleHLSSegmentM4S handles HLS media segments
+// handleHLSSegmentM4S handles /hlsv2/{infoHash}/segment{sequence}.m4s and /hlsv2/{infoHash}/{fileIndex}/segment{sequence}.m4s HLS M4S segments
 func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -2847,7 +2855,7 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleHLSAudio0M3U8 handles the /hlsv2/{infoHash}/audio0.m3u8 route
+// handleHLSAudio0M3U8 handles /hlsv2/{infoHash}/audio0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/audio0.m3u8 HLS audio playlists
 func (s *Server) handleHLSAudio0M3U8(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -2884,7 +2892,7 @@ func (s *Server) handleHLSAudio0M3U8(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(playlist))
 }
 
-// handleHLSAudioInitSegment handles the initialization segment for HLS audio
+// handleHLSAudioInitSegment handles /hlsv2/{infoHash}/{fileIndex}/audio0/init.mp4 HLS audio init segments
 func (s *Server) handleHLSAudioInitSegment(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -3010,7 +3018,7 @@ func (s *Server) handleHLSAudioInitSegment(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// handleHLSAudioSegmentM4S handles HLS media segments for audio
+// handleHLSAudioSegmentM4S handles /hlsv2/{infoHash}/{fileIndex}/audio0/segment{sequence}.m4s HLS audio M4S segments
 func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -3106,78 +3114,7 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// handleHLSSubtitleM3U8 handles the subtitle playlist
-func (s *Server) handleHLSSubtitleM3U8(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
-
-	// Get torrent engine
-	engine, exists := s.engineFS.torrentManager.GetTorrent(infoHash)
-	if !exists {
-		// Try to create the torrent from the mediaURL if available
-		mediaURL := r.URL.Query().Get("mediaURL")
-		if mediaURL != "" {
-			var trackers []string
-			var dhtEnabled bool
-			parsedURL, _ := url.Parse(mediaURL)
-			for key, values := range parsedURL.Query() {
-				if key == "tr" {
-					for _, value := range values {
-						if strings.HasPrefix(value, "tracker:") {
-							trackerURL := strings.TrimPrefix(value, "tracker:")
-							trackers = append(trackers, trackerURL)
-						} else if strings.HasPrefix(value, "dht:") {
-							dhtEnabled = true
-						}
-					}
-				}
-			}
-			magnetURI := fmt.Sprintf("magnet:?xt=urn:btih:%s", infoHash)
-			if len(trackers) > 0 {
-				for _, tracker := range trackers {
-					magnetURI += "&tr=" + url.QueryEscape(tracker)
-				}
-			}
-			log.Printf("HLS subtitle0.m3u8: Creating torrent %s with %d trackers, DHT: %v", infoHash, len(trackers), dhtEnabled)
-			var err error
-			if len(trackers) > 0 || dhtEnabled {
-				engine, err = s.engineFS.torrentManager.AddTorrentWithConfig(magnetURI, trackers, dhtEnabled, 30, 150, fileIndex)
-			} else {
-				engine, err = s.engineFS.torrentManager.AddTorrent(magnetURI, fileIndex)
-			}
-			if err != nil {
-				log.Printf("HLS subtitle0.m3u8: Error creating torrent: %v", err)
-				http.Error(w, "Failed to create torrent 3", http.StatusInternalServerError)
-				return
-			}
-			log.Printf("HLS subtitle0.m3u8: Successfully created torrent engine for: %s", engine.InfoHash)
-		} else {
-			http.Error(w, "Torrent not found", http.StatusNotFound)
-			return
-		}
-	}
-
-	// Get file info
-	_, err := engine.GetFile(fileIndex)
-	if err != nil {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-
-	// Build query parameters for segments (preserve original order)
-	queryString := ""
-	if r.URL.RawQuery != "" {
-		queryString = "?" + r.URL.RawQuery
-	}
-
-	// Generate HLS subtitle playlist
-	playlist := s.generateHLSSubtitlePlaylist(engine, fileIndex, queryString)
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Write([]byte(playlist))
-}
-
-// handleHLSSubtitleInitSegment handles the initialization segment for subtitles
+// handleHLSSubtitleInitSegment handles /hlsv2/{infoHash}/{fileIndex}/subtitle0/init.mp4 HLS subtitle init segments
 func (s *Server) handleHLSSubtitleInitSegment(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -3303,7 +3240,7 @@ func (s *Server) handleHLSSubtitleInitSegment(w http.ResponseWriter, r *http.Req
 	}
 }
 
-// handleHLSSubtitleSegmentM4S handles HLS media segments for subtitles
+// handleHLSSubtitleSegmentM4S handles /hlsv2/{infoHash}/{fileIndex}/subtitle0/segment{sequence}.m4s HLS subtitle M4S segments
 func (s *Server) handleHLSSubtitleSegmentM4S(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
@@ -3393,7 +3330,7 @@ func (s *Server) handleHLSSubtitleSegmentM4S(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// handleHLSSegmentTranscode handles HLS segment requests with ffmpeg transcoding
+// handleHLSSegmentTranscode handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/transcode/{seg}.ts HLS transcoded segments
 func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -3525,7 +3462,7 @@ func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// handleHLSStreamSplit handles HLS stream playlist requests with ffmpeg splitting
+// handleHLSStreamSplit handles /hlsv2/{infoHash}/{fileIndex}/stream-q-{quality}/split.m3u8 HLS stream split playlists
 func (s *Server) handleHLSStreamSplit(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash := vars["infoHash"]
@@ -3609,7 +3546,7 @@ func (s *Server) Start() error {
 	}
 
 	// Initialize torrent manager
-	torrentManager, err := NewTorrentManager(filepath.Join(s.config.AppPath, "stremio-cache"))
+	torrentManager, err := NewTorrentManager(filepath.Join(s.config.AppPath, "stremio-cache"), s.config.KeepTorrentsAlive)
 	if err != nil {
 		return fmt.Errorf("failed to create torrent manager: %v", err)
 	}
@@ -3759,13 +3696,14 @@ var startTime = time.Now()
 func main() {
 	// Parse environment variables (matching Node.js server.js exactly)
 	config := &Config{
-		HTTPPort:  getEnvInt("HTTP_PORT", 11470),  // Default port matching Node.js
-		HTTPSPort: getEnvInt("HTTPS_PORT", 12470), // Default HTTPS port matching Node.js
-		AppPath:   getEnv("APP_PATH", expandHomeDir("~/.stremio-server")),
-		NoCORS:    getEnvBool("NO_CORS", false),
-		Username:  getEnv("USERNAME", ""),
-		Password:  getEnv("PASSWORD", ""),
-		LogLevel:  getEnv("LOG_LEVEL", "info"),
+		HTTPPort:          getEnvInt("HTTP_PORT", 11470),  // Default port matching Node.js
+		HTTPSPort:         getEnvInt("HTTPS_PORT", 12470), // Default HTTPS port matching Node.js
+		AppPath:           getEnv("APP_PATH", expandHomeDir("~/.stremio-server")),
+		NoCORS:            getEnvBool("NO_CORS", false),
+		Username:          getEnv("USERNAME", ""),
+		Password:          getEnv("PASSWORD", ""),
+		LogLevel:          getEnv("LOG_LEVEL", "info"),
+		KeepTorrentsAlive: getEnvBool("KEEP_TORRENTS_ALIVE", true),
 		FFmpeg: &FFmpegConfig{
 			HardwareAcceleration: getEnvBool("FFMPEG_HARDWARE_ACCEL", true),
 			TranscodeHorsepower:  getEnvFloat("FFMPEG_HORSEPOWER", 0.75),
@@ -4799,4 +4737,75 @@ func (m *mp4WriteSeeker) Seek(offset int64, whence int) (int64, error) {
 		return int64(m.buf.Len()), nil
 	}
 	return 0, io.EOF
+}
+
+// handleHLSSubtitleM3U8 handles /hlsv2/{infoHash}/subtitle0.m3u8 and /hlsv2/{infoHash}/{fileIndex}/subtitle0.m3u8 HLS subtitle playlists
+func (s *Server) handleHLSSubtitleM3U8(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
+
+	// Get torrent engine
+	engine, exists := s.engineFS.torrentManager.GetTorrent(infoHash)
+	if !exists {
+		// Try to create the torrent from the mediaURL if available
+		mediaURL := r.URL.Query().Get("mediaURL")
+		if mediaURL != "" {
+			var trackers []string
+			var dhtEnabled bool
+			parsedURL, _ := url.Parse(mediaURL)
+			for key, values := range parsedURL.Query() {
+				if key == "tr" {
+					for _, value := range values {
+						if strings.HasPrefix(value, "tracker:") {
+							trackerURL := strings.TrimPrefix(value, "tracker:")
+							trackers = append(trackers, trackerURL)
+						} else if strings.HasPrefix(value, "dht:") {
+							dhtEnabled = true
+						}
+					}
+				}
+			}
+			magnetURI := fmt.Sprintf("magnet:?xt=urn:btih:%s", infoHash)
+			if len(trackers) > 0 {
+				for _, tracker := range trackers {
+					magnetURI += "&tr=" + url.QueryEscape(tracker)
+				}
+			}
+			log.Printf("HLS subtitle0.m3u8: Creating torrent %s with %d trackers, DHT: %v", infoHash, len(trackers), dhtEnabled)
+			var err error
+			if len(trackers) > 0 || dhtEnabled {
+				engine, err = s.engineFS.torrentManager.AddTorrentWithConfig(magnetURI, trackers, dhtEnabled, 30, 150, fileIndex)
+			} else {
+				engine, err = s.engineFS.torrentManager.AddTorrent(magnetURI, fileIndex)
+			}
+			if err != nil {
+				log.Printf("HLS subtitle0.m3u8: Error creating torrent: %v", err)
+				http.Error(w, "Failed to create torrent 3", http.StatusInternalServerError)
+				return
+			}
+			log.Printf("HLS subtitle0.m3u8: Successfully created torrent engine for: %s", engine.InfoHash)
+		} else {
+			http.Error(w, "Torrent not found", http.StatusNotFound)
+			return
+		}
+	}
+
+	// Get file info
+	_, err := engine.GetFile(fileIndex)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	// Build query parameters for segments (preserve original order)
+	queryString := ""
+	if r.URL.RawQuery != "" {
+		queryString = "?" + r.URL.RawQuery
+	}
+
+	// Generate HLS subtitle playlist
+	playlist := s.generateHLSSubtitlePlaylist(engine, fileIndex, queryString)
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Write([]byte(playlist))
 }
