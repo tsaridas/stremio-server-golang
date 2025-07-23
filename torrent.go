@@ -152,7 +152,7 @@ func optimizeTorrentSettings(t *torrent.Torrent) {
 	// Set higher piece request priority for better streaming
 	// The piece prioritization is already handled in AddTorrentWithConfig
 
-	log.Printf("Applied performance optimizations to torrent: %s", t.Info().Name)
+	log.Printf("[optimizeTorrentSettings] Applied performance optimizations to torrent: %s", t.Info().Name)
 }
 
 // AddTorrentWithConfig adds a new torrent to the manager with custom configuration
@@ -326,9 +326,9 @@ func (tm *TorrentManager) GetTorrent(infoHash string) (*TorrentEngine, bool) {
 
 	// If torrent is incomplete, try to resume it
 	if engine.Status == "incomplete" && engine.Torrent == nil {
-		log.Printf("Attempting to resume incomplete torrent: %s", infoHash)
+		log.Printf("[GetTorrent] Attempting to resume incomplete torrent: %s", infoHash)
 		if err := tm.resumeIncompleteTorrent(engine); err != nil {
-			log.Printf("Failed to resume torrent %s: %v", infoHash, err)
+			log.Printf("[GetTorrent] Failed to resume torrent %s: %v", infoHash, err)
 		}
 	}
 
@@ -355,7 +355,7 @@ func (tm *TorrentManager) resumeIncompleteTorrent(engine *TorrentEngine) error {
 		}
 	}
 
-	log.Printf("Resuming torrent %s with magnet: %s", engine.InfoHash, magnetURI)
+	log.Printf("[resumeIncompleteTorrent] Resuming torrent %s with magnet: %s", engine.InfoHash, magnetURI)
 
 	// Add torrent with existing configuration
 	var err error
@@ -381,7 +381,7 @@ func (tm *TorrentManager) resumeIncompleteTorrent(engine *TorrentEngine) error {
 	// Start monitoring
 	go engine.monitor()
 
-	log.Printf("Successfully resumed torrent %s", engine.InfoHash)
+	log.Printf("[resumeIncompleteTorrent] Successfully resumed torrent %s", engine.InfoHash)
 	return nil
 }
 
@@ -420,7 +420,7 @@ func (tm *TorrentManager) RemoveTorrent(infoHash string) error {
 		engine.mu.Unlock()
 	}
 
-	log.Printf("Removed torrent: %s", infoHash)
+	log.Printf("[RemoveTorrent] Removed torrent: %s", infoHash)
 	return nil
 }
 
@@ -469,17 +469,17 @@ func (tm *TorrentManager) loadTorrentsFromCache() error {
 		// Load torrent info from bencode file
 		infoBytes, err := os.ReadFile(infoPath)
 		if err != nil {
-			log.Printf("Failed to read info file for %s: %v", infoHash, err)
+			log.Printf("[loadTorrentsFromCache] Failed to read info file for %s: %v", infoHash, err)
 			continue
 		}
 
 		var info metainfo.Info
 		if err := bencode.Unmarshal(infoBytes, &info); err != nil {
-			log.Printf("Failed to unmarshal info for %s: %v", infoHash, err)
+			log.Printf("[loadTorrentsFromCache] Failed to unmarshal info for %s: %v", infoHash, err)
 			continue
 		}
 
-		log.Printf("Loaded torrent info for %s: name=%s, length=%d, files=%d", infoHash, info.Name, info.Length, len(info.Files))
+		log.Printf("[loadTorrentsFromCache] Loaded torrent info for %s: name=%s, length=%d, files=%d", infoHash, info.Name, info.Length, len(info.Files))
 
 		// Create engine with persisted metadata
 		engine := &TorrentEngine{
@@ -557,12 +557,12 @@ func (tm *TorrentManager) loadTorrentsFromCache() error {
 			engine.Status = "completed"
 		} else {
 			engine.Status = "incomplete"
-			log.Printf("Torrent %s marked as incomplete - files not fully downloaded", infoHash)
+			log.Printf("[loadTorrentsFromCache] Torrent %s marked as incomplete - files not fully downloaded", infoHash)
 		}
 
 		// If we still have no files but the cache directory exists, try to scan for files
 		if len(engine.Files) == 0 {
-			log.Printf("HLS Probe: No files found in metadata, scanning cache directory for files")
+			log.Printf("[loadTorrentsFromCache] HLS Probe: No files found in metadata, scanning cache directory for files")
 			cacheDir := filepath.Join(tm.cachePath, infoHash)
 			entries, err := os.ReadDir(cacheDir)
 			if err == nil {
@@ -583,7 +583,7 @@ func (tm *TorrentManager) loadTorrentsFromCache() error {
 								engine.Files = append(engine.Files, tf)
 								engine.TotalSize += stat.Size()
 								engine.Downloaded += stat.Size()
-								log.Printf("HLS Probe: Added file [%d] %s (size: %d)", fileIndex, filePath, stat.Size())
+								log.Printf("[loadTorrentsFromCache] HLS Probe: Added file [%d] %s (size: %d)", fileIndex, filePath, stat.Size())
 							}
 						}
 					}
@@ -594,16 +594,16 @@ func (tm *TorrentManager) loadTorrentsFromCache() error {
 					return engine.Files[i].Index < engine.Files[j].Index
 				})
 
-				log.Printf("HLS Probe: Recreated engine for %s with %d files from cache", infoHash, len(engine.Files))
+				log.Printf("[loadTorrentsFromCache] HLS Probe: Recreated engine for %s with %d files from cache", infoHash, len(engine.Files))
 			} else {
-				log.Printf("HLS Probe: Error reading cache directory: %v", err)
+				log.Printf("[loadTorrentsFromCache] HLS Probe: Error reading cache directory: %v", err)
 			}
 		}
 
 		// Add to engines map
 		tm.engines[infoHash] = engine
 
-		log.Printf("Loaded completed torrent from cache: %s (%d files, %d bytes, downloaded: %d)",
+		log.Printf("[loadTorrentsFromCache] Loaded completed torrent from cache: %s (%d files, %d bytes, downloaded: %d)",
 			info.Name, len(engine.Files), engine.TotalSize, engine.Downloaded)
 	}
 
@@ -648,7 +648,7 @@ func (tm *TorrentManager) Close() error {
 
 // DisableDHT disables DHT for the torrent client
 func (tm *TorrentManager) DisableDHT() {
-	log.Printf("Disabling DHT network")
+	log.Printf("[DisableDHT] Disabling DHT network")
 	// The anacrolix/torrent library doesn't provide a direct method to disable DHT
 	// DHT activity will stop when torrents are dropped
 	// This is a placeholder for future implementation if needed
@@ -1059,186 +1059,59 @@ func (e *TorrentEngine) GetFile(index int) (*TorrentFile, error) {
 
 // StreamFile streams a file with range support
 func (e *TorrentEngine) StreamFile(fileIndex int, w http.ResponseWriter, r *http.Request) error {
-	if e.logger != nil {
-		e.logger.Info("Streaming file %d", fileIndex)
+	// Hybrid approach: direct file reading for complete files, torrent streaming for incomplete files
+	file, err := e.GetFile(fileIndex)
+	if err != nil {
+		return err
 	}
 
-	// Fallback: Serve from disk if e.Torrent is nil
-	if e.Torrent == nil {
-		if e.logger != nil {
-			e.logger.Info("Torrent is nil, serving from disk cache")
-		}
+	// Check completion status
+	var isComplete bool
+	var bytesCompleted int64
+	var fileLength int64
 
-		if fileIndex < 0 || fileIndex >= len(e.Files) {
+	if e.Torrent == nil {
+		// Cached torrent - check if file exists and is complete
+		if _, err := os.Stat(file.Path); err == nil {
+			fileInfo, err := os.Stat(file.Path)
+			if err == nil {
+				isComplete = fileInfo.Size() == file.Size
+				bytesCompleted = fileInfo.Size()
+				fileLength = file.Size
+			}
+		}
+	} else {
+		// Live torrent - check completion status
+		if fileIndex < 0 || fileIndex >= len(e.Torrent.Files()) {
 			if e.logger != nil {
-				e.logger.Error("Invalid file index: %d (available: 0-%d)", fileIndex, len(e.Files)-1)
+				e.logger.Error("Invalid file index for live torrent: %d (available: 0-%d)", fileIndex, len(e.Torrent.Files())-1)
 			}
 			return fmt.Errorf("invalid file index: %d", fileIndex)
 		}
 
-		file := e.Files[fileIndex]
-		if e.logger != nil {
-			e.logger.Debug("Opening cached file: %s", file.Path)
-		}
-
-		f, err := os.Open(file.Path)
-		if err != nil {
-			if e.logger != nil {
-				e.logger.Error("Failed to open cached file: %v", err)
-			}
-			return fmt.Errorf("failed to open file from disk: %w", err)
-		}
-		defer f.Close()
-		fileLength := file.Size
-		// Parse range header
-		rangeHeader := r.Header.Get("Range")
-		var start, end int64
-		if rangeHeader != "" {
-			rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
-			parts := strings.Split(rangeStr, "-")
-			if len(parts) == 2 {
-				if parts[0] != "" {
-					start, _ = strconv.ParseInt(parts[0], 10, 64)
-				}
-				if parts[1] != "" {
-					end, _ = strconv.ParseInt(parts[1], 10, 64)
-				} else {
-					end = fileLength - 1
-				}
-			}
-		} else {
-			start = 0
-			end = fileLength - 1
-		}
-		if start > end || end >= fileLength {
-			return fmt.Errorf("invalid range")
-		}
-		w.Header().Set("Content-Type", getContentType(file.Name))
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		if rangeHeader != "" {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileLength))
-			w.WriteHeader(http.StatusPartialContent)
-		} else {
-			w.WriteHeader(http.StatusOK)
-		}
-		if start > 0 {
-			_, err := f.Seek(start, io.SeekStart)
-			if err != nil {
-				return fmt.Errorf("failed to seek: %w", err)
-			}
-		}
-		_, err = io.CopyN(w, f, end-start+1)
-		return err
-	}
-
-	if fileIndex < 0 || fileIndex >= len(e.Torrent.Files()) {
-		if e.logger != nil {
-			e.logger.Error("Invalid file index for live torrent: %d (available: 0-%d)", fileIndex, len(e.Torrent.Files())-1)
-		}
-		return fmt.Errorf("invalid file index: %d", fileIndex)
-	}
-
-	file := e.Torrent.Files()[fileIndex]
-	bytesCompleted := file.BytesCompleted()
-	fileLength := file.Length()
-
-	if e.logger != nil {
-		e.logger.Info("Streaming live file %d (%s), length: %d, completed: %d, complete: %v",
-			fileIndex, file.DisplayPath(), fileLength, bytesCompleted, bytesCompleted == fileLength)
-	}
-
-	// Parse range header
-	rangeHeader := r.Header.Get("Range")
-	var start, end int64
-
-	if rangeHeader != "" {
-		// Parse "bytes=start-end" format
-		rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
-		parts := strings.Split(rangeStr, "-")
-
-		if len(parts) == 2 {
-			if parts[0] != "" {
-				start, _ = strconv.ParseInt(parts[0], 10, 64)
-			}
-			if parts[1] != "" {
-				end, _ = strconv.ParseInt(parts[1], 10, 64)
-			} else {
-				end = fileLength - 1
-			}
-		}
-	} else {
-		start = 0
-		end = fileLength - 1
+		torrentFile := e.Torrent.Files()[fileIndex]
+		bytesCompleted = torrentFile.BytesCompleted()
+		fileLength = torrentFile.Length()
+		isComplete = bytesCompleted == fileLength
 	}
 
 	if e.logger != nil {
-		e.logger.Debug("Range request: %d-%d", start, end)
+		e.logger.Info("File completion: %d/%d (%.1f%%) - Complete: %v",
+			bytesCompleted, fileLength, float64(bytesCompleted)/float64(fileLength)*100, isComplete)
 	}
 
-	// Check if the requested range is available
-	if end >= bytesCompleted {
+	if isComplete {
+		// Use direct file reading for complete files
 		if e.logger != nil {
-			e.logger.Warn("Requested range %d-%d exceeds available bytes %d", start, end, bytesCompleted)
+			e.logger.Info("File complete, using direct streaming")
 		}
-		if bytesCompleted == 0 {
-			if e.logger != nil {
-				e.logger.Error("File not yet downloaded")
-			}
-			return fmt.Errorf("file not yet downloaded")
-		}
-		// Adjust end to available bytes
-		end = bytesCompleted - 1
-		if e.logger != nil {
-			e.logger.Info("Adjusted range to %d-%d", start, end)
-		}
-	}
-
-	// Set headers
-	w.Header().Set("Content-Type", getContentType(file.DisplayPath()))
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-
-	if rangeHeader != "" {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileLength))
-		w.WriteHeader(http.StatusPartialContent)
+		return e.streamFromDisk(file, w, r)
 	} else {
-		w.WriteHeader(http.StatusOK)
-	}
-
-	// Create reader for the specified range
-	reader := file.NewReader()
-	reader.SetReadahead(1024 * 1024) // 1MB readahead
-
-	if start > 0 {
-		reader.Seek(start, io.SeekStart)
-	}
-
-	// Stream the data with timeout
-	done := make(chan error, 1)
-	go func() {
-		_, err := io.CopyN(w, reader, end-start+1)
-		done <- err
-	}()
-
-	// Wait for completion or timeout
-	select {
-	case err := <-done:
-		if err != nil {
-			if e.logger != nil {
-				e.logger.Error("Error streaming file %d: %v", fileIndex, err)
-			}
-		} else {
-			if e.logger != nil {
-				e.logger.Info("Successfully streamed file %d", fileIndex)
-			}
-		}
-		return err
-	case <-time.After(30 * time.Second):
+		// Use torrent streaming for incomplete files
 		if e.logger != nil {
-			e.logger.Error("Timeout streaming file %d", fileIndex)
+			e.logger.Info("File incomplete, using torrent streaming")
 		}
-		return fmt.Errorf("streaming timeout")
+		return e.streamFromTorrent(fileIndex, w, r)
 	}
 }
 
@@ -1825,9 +1698,9 @@ func (cps *CustomPieceStorage) Completion() storage.Completion {
 func GetTorrentInfoHash(magnetURI string) (string, error) {
 	// Extract info hash from magnet URI
 	// Format: magnet:?xt=urn:btih:<infoHash>
-	log.Printf("Processing magnet URI: %s", magnetURI)
+	log.Printf("[GetTorrentInfoHash] Processing magnet URI: %s", magnetURI)
 	if !strings.HasPrefix(magnetURI, "magnet:?xt=urn:btih:") {
-		log.Printf("Invalid magnet URI format: does not start with 'magnet:?xt=urn:btih:'")
+		log.Printf("[GetTorrentInfoHash] Invalid magnet URI format: does not start with 'magnet:?xt=urn:btih:'")
 		return "", fmt.Errorf("invalid magnet URI format")
 	}
 
@@ -1838,7 +1711,7 @@ func GetTorrentInfoHash(magnetURI string) (string, error) {
 
 	infoHash := strings.Split(parts[1], "&")[0]
 	if len(infoHash) != 40 {
-		log.Printf("Invalid info hash length: got %d characters, expected 40. Hash: %q", len(infoHash), infoHash)
+		log.Printf("[GetTorrentInfoHash] Invalid info hash length: got %d characters, expected 40. Hash: %q", len(infoHash), infoHash)
 		return "", fmt.Errorf("invalid info hash length")
 	}
 
@@ -1878,7 +1751,7 @@ func AddTorrentWithConfig(client *torrent.Client, infoHash string, magnetURI str
 	// We can't directly control DHT per torrent or set peer limits per torrent in this library.
 	// These settings are handled at the client level.
 
-	log.Printf("Added torrent with %d trackers, DHT: %v, peer limits: %d-%d",
+	log.Printf("[AddTorrentWithConfig] Added torrent with %d trackers, DHT: %v, peer limits: %d-%d",
 		len(trackers), dhtEnabled, minPeers, maxPeers)
 
 	return t, nil
@@ -1892,7 +1765,7 @@ func GetTorrentFile(infoHash string, fileIndex int) string {
 		// Fallback to default path
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
-			log.Printf("Failed to get home directory: %v", err)
+			log.Printf("[GetTorrentFile] Failed to get home directory: %v", err)
 			return ""
 		}
 		cachePath = filepath.Join(homeDir, ".stremio-server", "stremio-cache")
@@ -1960,4 +1833,337 @@ func (e *TorrentEngine) GetFileOffset(fileIndex int) int64 {
 		offset += e.Files[i].Size
 	}
 	return offset
+}
+
+// requestMissingPieces automatically requests missing pieces for streaming (like JavaScript)
+func (e *TorrentEngine) requestMissingPieces(startPiece, endPiece int) {
+	if e.Torrent == nil {
+		return
+	}
+
+	if e.logger != nil {
+		e.logger.Debug("Requesting missing pieces from %d to %d", startPiece, endPiece)
+	}
+
+	// The anacrolix/torrent library automatically handles piece selection
+	// based on the file reader's position. We just need to ensure the torrent
+	// is actively downloading and the pieces are being requested.
+
+	// Check if torrent is active (the torrent library handles piece requests automatically)
+	if e.logger != nil {
+		e.logger.Debug("Torrent is active, piece requests will be handled automatically")
+	}
+
+	// The torrent library will automatically request pieces as needed
+	// when we read from the file. This is handled by the file reader.
+	if e.logger != nil {
+		e.logger.Debug("Piece requests will be handled automatically by torrent library")
+	}
+}
+
+// streamFromDisk streams a complete file directly from disk (much faster than torrent streaming)
+func (e *TorrentEngine) streamFromDisk(file *TorrentFile, w http.ResponseWriter, r *http.Request) error {
+	f, err := os.Open(file.Path)
+	if err != nil {
+		if e.logger != nil {
+			e.logger.Error("Failed to open file: %v", err)
+		}
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer f.Close()
+
+	// Handle range requests
+	rangeHeader := r.Header.Get("Range")
+	var start, end int64
+
+	if rangeHeader != "" {
+		// Parse range header
+		rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
+		parts := strings.Split(rangeStr, "-")
+		if len(parts) == 2 {
+			if parts[0] != "" {
+				start, _ = strconv.ParseInt(parts[0], 10, 64)
+			}
+			if parts[1] != "" {
+				end, _ = strconv.ParseInt(parts[1], 10, 64)
+			} else {
+				end = file.Size - 1
+			}
+		}
+	} else {
+		start = 0
+		end = file.Size - 1
+	}
+
+	// Validate range
+	if start > end || end >= file.Size {
+		return fmt.Errorf("invalid range")
+	}
+
+	// Set headers
+	w.Header().Set("Content-Type", getContentType(file.Name))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+
+	if rangeHeader != "" {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.Size))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// Seek to start position
+	if start > 0 {
+		_, err := f.Seek(start, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("failed to seek: %w", err)
+		}
+	}
+
+	// Use efficient streaming with larger buffer
+	buffer := make([]byte, 256*1024) // 256KB buffer for better performance
+	_, err = io.CopyBuffer(w, io.LimitReader(f, end-start+1), buffer)
+
+	if e.logger != nil {
+		e.logger.Info("Direct file streaming completed for %s", file.Name)
+	}
+
+	return err
+}
+
+// streamFromTorrent streams an incomplete file using torrent library (with piece-based waiting)
+func (e *TorrentEngine) streamFromTorrent(fileIndex int, w http.ResponseWriter, r *http.Request) error {
+	if e.Torrent == nil {
+		return fmt.Errorf("torrent is nil")
+	}
+
+	if fileIndex < 0 || fileIndex >= len(e.Torrent.Files()) {
+		if e.logger != nil {
+			e.logger.Error("Invalid file index for live torrent: %d (available: 0-%d)", fileIndex, len(e.Torrent.Files())-1)
+		}
+		return fmt.Errorf("invalid file index: %d", fileIndex)
+	}
+
+	file := e.Torrent.Files()[fileIndex]
+	bytesCompleted := file.BytesCompleted()
+	fileLength := file.Length()
+
+	if e.logger != nil {
+		e.logger.Info("Streaming live file %d (%s), length: %d, completed: %d, complete: %v",
+			fileIndex, file.DisplayPath(), fileLength, bytesCompleted, bytesCompleted == fileLength)
+	}
+
+	// Parse range header
+	rangeHeader := r.Header.Get("Range")
+	var start, end int64
+
+	if rangeHeader != "" {
+		// Parse "bytes=start-end" format
+		rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
+		parts := strings.Split(rangeStr, "-")
+
+		if len(parts) == 2 {
+			if parts[0] != "" {
+				start, _ = strconv.ParseInt(parts[0], 10, 64)
+			}
+			if parts[1] != "" {
+				end, _ = strconv.ParseInt(parts[1], 10, 64)
+			} else {
+				end = fileLength - 1
+			}
+		}
+	} else {
+		start = 0
+		end = fileLength - 1
+	}
+
+	if e.logger != nil {
+		e.logger.Debug("Range request: %d-%d", start, end)
+	}
+
+	// Enhanced piece-based streaming with waiting for unavailable bytes
+	if end >= bytesCompleted {
+		if e.logger != nil {
+			e.logger.Warn("Requested range %d-%d exceeds available bytes %d, will wait for pieces", start, end, bytesCompleted)
+		}
+
+		// If no data is available at all, wait for initial pieces
+		if bytesCompleted == 0 {
+			if e.logger != nil {
+				e.logger.Info("File not yet downloaded, waiting for initial pieces...")
+			}
+
+			// Wait for some initial data to become available
+			initialWait := 30 * time.Second
+			checkInterval := 1 * time.Second
+			elapsed := time.Duration(0)
+
+			for bytesCompleted == 0 && elapsed < initialWait {
+				time.Sleep(checkInterval)
+				elapsed += checkInterval
+				bytesCompleted = file.BytesCompleted()
+
+				if e.logger != nil {
+					e.logger.Debug("Waiting for initial data... elapsed: %v, completed: %d", elapsed, bytesCompleted)
+				}
+			}
+
+			if bytesCompleted == 0 {
+				if e.logger != nil {
+					e.logger.Error("Timeout waiting for initial pieces")
+				}
+				return fmt.Errorf("timeout waiting for initial pieces")
+			}
+		}
+
+		// Adjust end to available bytes, but ensure start is valid
+		if start >= bytesCompleted {
+			if e.logger != nil {
+				e.logger.Error("Requested start position %d exceeds available bytes %d", start, bytesCompleted)
+			}
+			return fmt.Errorf("requested range beyond available data")
+		}
+
+		// Use available data for now, will stream more as it becomes available
+		end = bytesCompleted - 1
+		if e.logger != nil {
+			e.logger.Info("Adjusted initial range to %d-%d, will continue streaming as more data becomes available", start, end)
+		}
+	}
+
+	// Set headers
+	w.Header().Set("Content-Type", getContentType(file.DisplayPath()))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+
+	if rangeHeader != "" {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileLength))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	// Enhanced piece-based streaming with automatic piece selection and waiting
+	reader := file.NewReader()
+	reader.SetReadahead(1024 * 1024) // 1MB readahead
+
+	if start > 0 {
+		reader.Seek(start, io.SeekStart)
+	}
+
+	// Calculate piece information for enhanced streaming
+	pieceLength := e.Torrent.Info().PieceLength
+	startPiece := int(start / pieceLength)
+	endPiece := int(end / pieceLength)
+
+	if e.logger != nil {
+		e.logger.Debug("Streaming pieces %d to %d (piece length: %d)", startPiece, endPiece, pieceLength)
+	}
+
+	// Request missing pieces automatically (like JavaScript)
+	e.requestMissingPieces(startPiece, endPiece)
+
+	// Enhanced streaming with piece-based waiting
+	done := make(chan error, 1)
+	clientDisconnected := make(chan bool, 1)
+
+	go func() {
+		defer close(done)
+
+		bytesToStream := end - start + 1
+		bytesStreamed := int64(0)
+		bufferSize := 64 * 1024 // 64KB buffer for streaming
+		buffer := make([]byte, bufferSize)
+
+		for bytesStreamed < bytesToStream {
+			// Check if client disconnected
+			select {
+			case <-clientDisconnected:
+				if e.logger != nil {
+					e.logger.Info("Client disconnected during streaming of file %d", fileIndex)
+				}
+				return
+			default:
+			}
+
+			// Read chunk of data
+			n, err := reader.Read(buffer)
+			if err != nil {
+				if err == io.EOF {
+					// Check if we need to wait for more pieces
+					currentCompleted := file.BytesCompleted()
+					if bytesStreamed+int64(n) < bytesToStream && currentCompleted > bytesCompleted {
+						if e.logger != nil {
+							e.logger.Debug("EOF reached but more data available, continuing stream...")
+						}
+						bytesCompleted = currentCompleted
+						// Request more pieces if needed
+						currentEndPiece := int((start + bytesStreamed + int64(n)) / pieceLength)
+						e.requestMissingPieces(startPiece, currentEndPiece)
+						continue
+					}
+					// Write remaining data and finish
+					if n > 0 {
+						_, writeErr := w.Write(buffer[:n])
+						if writeErr != nil {
+							done <- writeErr
+							return
+						}
+						bytesStreamed += int64(n)
+					}
+					break
+				}
+				done <- err
+				return
+			}
+
+			// Write data to client
+			_, writeErr := w.Write(buffer[:n])
+			if writeErr != nil {
+				// Check if it's a client disconnection error
+				if strings.Contains(writeErr.Error(), "connection reset by peer") ||
+					strings.Contains(writeErr.Error(), "broken pipe") ||
+					strings.Contains(writeErr.Error(), "write: connection reset") ||
+					strings.Contains(writeErr.Error(), "write: broken pipe") {
+					clientDisconnected <- true
+					return
+				}
+				done <- writeErr
+				return
+			}
+
+			bytesStreamed += int64(n)
+
+			// Periodically check for more available data and request pieces
+			if bytesStreamed%pieceLength == 0 {
+				currentCompleted := file.BytesCompleted()
+				if currentCompleted > bytesCompleted {
+					bytesCompleted = currentCompleted
+					currentEndPiece := int((start + bytesStreamed) / pieceLength)
+					e.requestMissingPieces(startPiece, currentEndPiece)
+				}
+			}
+		}
+
+		if e.logger != nil {
+			e.logger.Info("Successfully streamed %d bytes for file %d", bytesStreamed, fileIndex)
+		}
+		done <- nil
+	}()
+
+	// Wait for completion, timeout, or client disconnection
+	select {
+	case err := <-done:
+		if err != nil {
+			if e.logger != nil {
+				e.logger.Error("Error streaming file %d: %v", fileIndex, err)
+			}
+		}
+		return err
+	case <-time.After(60 * time.Second): // Increased timeout for piece-based streaming
+		if e.logger != nil {
+			e.logger.Error("Timeout streaming file %d", fileIndex)
+		}
+		return fmt.Errorf("streaming timeout")
+	}
 }

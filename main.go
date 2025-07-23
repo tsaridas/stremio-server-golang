@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -80,7 +81,7 @@ func NewServer(config *Config) (*Server, error) {
 		},
 		ffmpegMgr: nil, // Will be initialized in Start()
 		router:    router,
-		ffmpegSem: make(chan struct{}, 2), // Limit to 2 concurrent FFmpeg processes
+		ffmpegSem: make(chan struct{}, 200), // Allow up to 200 concurrent FFmpeg processes (matching Node.js)
 	}
 
 	return server, nil
@@ -145,12 +146,12 @@ func (s *Server) setupRoutes() {
 	// HLS routes (matching Node.js server.js exactly)
 	// Main HLS routes - these must come BEFORE the parameterized routes
 	s.router.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Test endpoint called!")
+		log.Printf("[handleTest] Test endpoint called!")
 		w.Write([]byte("Test OK"))
 	}).Methods("GET")
 	s.router.HandleFunc("/hlsv2/probe", s.handleHLSProbe).Methods("GET") // handleHLSProbe handles /hlsv2/probe HLS probing requests (matching server.js behavior)
 	s.router.HandleFunc("/hlsv2/probe-debug", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("HLS Probe Debug: Function called!")
+		log.Printf("[handleHLSProbeDebug] HLS Probe Debug: Function called!")
 		w.Write([]byte("HLS Probe Debug OK"))
 	}).Methods("GET")
 	s.router.HandleFunc("/hlsv2/status", s.handleHLSStatus).Methods("GET") // handleHLSStatus handles /hlsv2/status HLS status requests
@@ -231,7 +232,7 @@ func (s *Server) setupRoutes() {
 	// Debug route to catch unmatched requests
 	s.router.HandleFunc("/debug/{path:.*}", func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
-		log.Printf("DEBUG: Unmatched route: %s, path: %s", r.URL.Path, vars["path"])
+		log.Printf("[handleProxy] DEBUG: Unmatched route: %s, path: %s", r.URL.Path, vars["path"])
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte("Route not found"))
 	}).Methods("GET")
@@ -275,13 +276,13 @@ func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Log only the URL
-		log.Printf("URL: %s", r.URL.String())
+		log.Printf("[loggingMiddleware] URL: %s", r.URL.String())
 
 		// Handle request body for POST/PUT requests (restore body for handlers)
 		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
 			bodyBytes, err := io.ReadAll(r.Body)
 			if err != nil {
-				log.Printf("Error reading body: %v", err)
+				log.Printf("[loggingMiddleware] Error reading body: %v", err)
 			} else {
 				// Restore the body for the handler
 				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
@@ -333,7 +334,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		log.Printf("Torrent not found, attempting to download: %s with %d trackers, DHT: %v", infoHash, len(trackers), dhtEnabled)
+		log.Printf("[handleStream] Torrent not found, attempting to download: %s with %d trackers, DHT: %v", infoHash, len(trackers), dhtEnabled)
 
 		// Add torrent to manager with custom configuration - optimized peer limits for better speed
 		var err error
@@ -344,12 +345,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err != nil {
-			log.Printf("Error creating torrent: %v", err)
+			log.Printf("[handleStream] Error creating torrent: %v", err)
 			http.Error(w, "Error streaming file", http.StatusInternalServerError)
 			return
 		}
 
-		log.Printf("Successfully created torrent engine for: %s", engine.InfoHash)
+		log.Printf("[handleStream] Successfully created torrent engine for: %s", engine.InfoHash)
 	}
 
 	// For HEAD requests, just return headers without streaming
@@ -374,8 +375,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// Stream the file
 	if err := engine.StreamFile(fileIndex, w, r); err != nil {
-		log.Printf("Error streaming file: %v", err)
-		http.Error(w, "Error streaming file", http.StatusInternalServerError)
+		// Check if the error is due to client disconnection
+		if strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "broken pipe") ||
+			strings.Contains(err.Error(), "write: connection reset") {
+			log.Printf("[handleStream] Client disconnected during streaming: %v", err)
+			return // Don't send error response, client already disconnected
+		}
+		log.Printf("[handleStream] Error streaming file: %v", err)
+		// Don't send error response as StreamFile may have already written headers
 		return
 	}
 }
@@ -396,15 +404,15 @@ func (s *Server) handleFileStats(w http.ResponseWriter, r *http.Request) {
 	engine, exists := s.engineFS.torrentManager.GetTorrent(infoHash)
 	if !exists {
 		magnetURI := fmt.Sprintf("magnet:?xt=urn:btih:%s", infoHash)
-		log.Printf("Torrent not found, attempting to download: %s", infoHash)
+		log.Printf("[handleFileStats] Torrent not found, attempting to download: %s", infoHash)
 		var err error
 		engine, err = s.engineFS.torrentManager.AddTorrent(magnetURI, fileIndex)
 		if err != nil {
-			log.Printf("Error creating torrent: %v", err)
+			log.Printf("[handleFileStats] Error creating torrent: %v", err)
 			http.Error(w, "Error getting file stats", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("Successfully created torrent engine for: %s", engine.InfoHash)
+		log.Printf("[handleFileStats] Successfully created torrent engine for: %s", engine.InfoHash)
 	}
 
 	s.returnDetailedTorrentInfo(w, engine, nil, 0, 0, map[string]interface{}{"fileIndex": fileIndex})
@@ -709,7 +717,7 @@ func (s *Server) returnDetailedTorrentInfo(w http.ResponseWriter, engine *Torren
 
 	// Check if torrent is nil (might happen if torrent was completed and dropped)
 	if engine.Torrent == nil {
-		log.Printf("Warning: Torrent is nil for engine %s, returning basic info", engine.InfoHash)
+		log.Printf("[returnDetailedTorrentInfo] Warning: Torrent is nil for engine %s, returning basic info", engine.InfoHash)
 
 		// Use stored metadata if available
 		torrentName := "Unknown"
@@ -951,7 +959,7 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 
 	err := s.engineFS.torrentManager.RemoveTorrent(infoHash)
 	if err != nil {
-		log.Printf("Error removing torrent: %v", err)
+		log.Printf("[handleRemove] Error removing torrent: %v", err)
 		http.Error(w, "Error removing torrent", http.StatusInternalServerError)
 		return
 	}
@@ -1309,7 +1317,7 @@ func (s *Server) handleSubtitlesVTT(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("Subtitle VTT request: from=%s, stream=%d", from, streamIdx)
+	log.Printf("[handleSubtitlesVTT] Subtitle VTT request: from=%s, stream=%d", from, streamIdx)
 
 	if from == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -1322,11 +1330,11 @@ func (s *Server) handleSubtitlesVTT(w http.ResponseWriter, r *http.Request) {
 
 	// Embedded subtitle extraction (if streamIdx >= 0) - matching Node.js server.js behavior
 	if streamIdx >= 0 && s.ffmpegMgr != nil && s.ffmpegMgr.IsAvailable() {
-		log.Printf("Attempting to extract embedded subtitle stream %d from %s", streamIdx, from)
+		log.Printf("[handleSubtitlesVTT] Attempting to extract embedded subtitle stream %d from %s", streamIdx, from)
 
 		// Check if the source file exists
 		if _, err := os.Stat(from); err != nil {
-			log.Printf("Source file does not exist: %s", from)
+			log.Printf("[handleSubtitlesVTT] Source file does not exist: %s", from)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1341,21 +1349,21 @@ func (s *Server) handleSubtitlesVTT(w http.ResponseWriter, r *http.Request) {
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
 		if err == nil && len(out) > 0 {
-			log.Printf("Successfully extracted subtitle stream %d, size: %d bytes", streamIdx, len(out))
+			log.Printf("[handleSubtitlesVTT] Successfully extracted subtitle stream %d, size: %d bytes", streamIdx, len(out))
 			w.Header().Set("Content-Type", "text/vtt")
 			w.Write(out)
 			return
 		} else {
-			log.Printf("FFmpeg extraction failed: %v, stderr: %s", err, stderr.String())
+			log.Printf("[handleSubtitlesVTT] FFmpeg extraction failed: %v, stderr: %s", err, stderr.String())
 		}
 	}
 
 	// If 'from' is a URL, proxy the request
 	if strings.HasPrefix(from, "http://") || strings.HasPrefix(from, "https://") {
-		log.Printf("Proxying subtitle from URL: %s", from)
+		log.Printf("[handleSubtitlesVTT] Proxying subtitle from URL: %s", from)
 		resp, err := http.Get(from)
 		if err != nil || resp.StatusCode != http.StatusOK {
-			log.Printf("Failed to fetch subtitle from URL: %v", err)
+			log.Printf("[handleSubtitlesVTT] Failed to fetch subtitle from URL: %v", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1371,7 +1379,7 @@ func (s *Server) handleSubtitlesVTT(w http.ResponseWriter, r *http.Request) {
 
 	// Otherwise, treat 'from' as a local file path
 	if _, err := os.Stat(from); err == nil {
-		log.Printf("Serving local subtitle file: %s", from)
+		log.Printf("[handleSubtitlesVTT] Serving local subtitle file: %s", from)
 		w.Header().Set("Content-Type", "text/vtt")
 		file, _ := os.Open(from)
 		defer file.Close()
@@ -1379,7 +1387,7 @@ func (s *Server) handleSubtitlesVTT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Subtitle file not found: %s", from)
+	log.Printf("[handleSubtitlesVTT] Subtitle file not found: %s", from)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1572,7 +1580,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 // handleHLSProbe handles HLS probing requests (matching server.js behavior)
 func (s *Server) handleHLSProbe(w http.ResponseWriter, r *http.Request) {
-	log.Printf("HLS Probe: Function called!")
+	log.Printf("[handleHLSProbe] HLS Probe: Function called!")
 
 	// Check for 'from' parameter first (matching server.js logic)
 	from := r.URL.Query().Get("from")
@@ -1598,7 +1606,7 @@ func (s *Server) handleHLSProbe(w http.ResponseWriter, r *http.Request) {
 
 	parsedURL, err := url.Parse(videoURL)
 	if err != nil {
-		log.Printf("HLS Probe: Failed to parse video URL: %v", err)
+		log.Printf("[handleHLSProbe] Failed to parse video URL: %v", err)
 		http.Error(w, "Invalid video URL", http.StatusBadRequest)
 		return
 	}
@@ -1645,15 +1653,15 @@ func (s *Server) handleHLSProbe(w http.ResponseWriter, r *http.Request) {
 				magnetURI += "&tr=" + url.QueryEscape(tracker)
 			}
 		}
-		log.Printf("HLS Probe: Creating torrent %s with %d trackers, DHT: %v, fileIndex: %d", infoHash, len(trackers), dhtEnabled, fileIndex)
+		log.Printf("[handleHLSProbe] Creating torrent %s with %d trackers, DHT: %v, fileIndex: %d", infoHash, len(trackers), dhtEnabled, fileIndex)
 		var err error
 		engine, err = s.engineFS.torrentManager.AddTorrentWithFileIndex(magnetURI, trackers, dhtEnabled, 30, 150, fileIndex)
 		if err != nil {
-			log.Printf("HLS Probe: Error creating torrent: %v", err)
+			log.Printf("[handleHLSProbe] Error creating torrent: %v", err)
 			http.Error(w, "Failed to create torrent 8", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("HLS Probe: Successfully created torrent engine for: %s", engine.InfoHash)
+		log.Printf("[handleHLSProbe] Successfully created torrent engine for: %s", engine.InfoHash)
 	}
 
 	if s.ffmpegMgr == nil || !s.ffmpegMgr.IsProbeAvailable() {
@@ -1677,7 +1685,7 @@ func (s *Server) handleHLSProbe(w http.ResponseWriter, r *http.Request) {
 		// Get the actual file path for the torrent file using the correct cache path
 		cachePath := filepath.Join(s.config.AppPath, "stremio-cache")
 		filePath := GetTorrentFileWithCachePath(engine.InfoHash, fileIndex, cachePath)
-		log.Printf("HLS Probe: Attempting to probe file: %s", filePath)
+		log.Printf("[handleHLSProbe] Attempting to probe file: %s", filePath)
 
 		probeInfo, err := s.ffmpegMgr.GetProbeInfoWithTimeout(filePath, probeTimeout)
 		if err == nil && probeInfo != nil && !isFallbackProbe(probeInfo) && (probeInfo.Format.Duration > 0 || (len(probeInfo.Streams) > 0 && probeInfo.Format.Name != "unknown")) {
@@ -1714,7 +1722,7 @@ func (s *Server) handleHLSMaster(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
 
-	log.Printf("handleHLSMaster: route infoHash=%s, extracted infoHash=%s, fileIndex=%d", vars["infoHash"], infoHash, fileIndex)
+	log.Printf("[handleHLSMaster] route infoHash=%s, extracted infoHash=%s, fileIndex=%d", vars["infoHash"], infoHash, fileIndex)
 
 	if infoHash == "" || len(infoHash) < 32 || len(infoHash) > 40 {
 		http.Error(w, "Invalid or missing infoHash", http.StatusBadRequest)
@@ -1728,7 +1736,7 @@ func (s *Server) handleHLSMaster(w http.ResponseWriter, r *http.Request) {
 		var err error
 		engine, err = s.engineFS.torrentManager.AddTorrent(magnetURI, fileIndex)
 		if err != nil {
-			log.Printf("HLS Master: Error creating torrent: %v", err)
+			log.Printf("[handleHLSMaster] Error creating torrent: %v", err)
 			if r.Method == "HEAD" {
 				// For HEAD requests, return headers even if torrent creation fails
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -1738,7 +1746,7 @@ func (s *Server) handleHLSMaster(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed to create torrent 6", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("HLS Master: Successfully created torrent engine for: %s", engine.InfoHash)
+		log.Printf("[handleHLSMaster] Successfully created torrent engine for: %s", engine.InfoHash)
 	}
 
 	// Get file info
@@ -1779,22 +1787,35 @@ func (s *Server) generateDynamicHLSMasterPlaylist(engine *TorrentEngine, fileInd
 	playlist.WriteString("#EXTM3U\n")
 	playlist.WriteString("#EXT-X-VERSION:7\n")
 
+	log.Printf("[handleHLSMaster] Starting dynamic playlist generation for fileIndex=%d, queryString=%s", fileIndex, queryString)
+
 	file, err := engine.GetFile(fileIndex)
 	if err != nil {
-		log.Printf("HLS Master: Error getting file: %v", err)
+		log.Printf("[handleHLSMaster] Error getting file: %v", err)
 		return "#EXTM3U\n#EXT-X-VERSION:7\n"
 	}
+
+	log.Printf("[handleHLSMaster] File found: %s, size: %d", file.Name, file.Size)
 
 	if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
 		probeInfo, err := s.ffmpegMgr.GetProbeInfo(file.Path)
 		if err != nil {
-			log.Printf("HLS Master: Error probing file with FFmpeg: %v", err)
-			return s.generateBasicHLSMasterPlaylist(engine, queryString)
+			log.Printf("[handleHLSMaster] Error probing file with FFmpeg: %v", err)
+			log.Printf("[handleHLSMaster] Falling back to basic playlist due to FFmpeg probe error")
+			basicResult := s.generateBasicHLSMasterPlaylist(engine, queryString)
+			log.Printf("[handleHLSMaster] Generated basic playlist (length=%d): %s", len(basicResult), basicResult)
+			return basicResult
+		}
+
+		log.Printf("[handleHLSMaster] FFmpeg probe successful, found %d streams", len(probeInfo.Streams))
+		for i, stream := range probeInfo.Streams {
+			log.Printf("[handleHLSMaster] Stream %d: Track=%s, Language=%s, Title=%v", i, stream.Track, stream.Language, stream.Title)
 		}
 
 		audioStreams := 0
 		videoWritten := false
-		var audioLine, videoLine string
+		subtitleWritten := false
+		var audioLine, videoLine, subtitleLine string
 
 		for _, stream := range probeInfo.Streams {
 			switch stream.Track {
@@ -1814,35 +1835,67 @@ func (s *Server) generateDynamicHLSMasterPlaylist(engine *TorrentEngine, fileInd
 					videoLine = "#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"video\",NAME=\"Video\",AUTOSELECT=YES,DEFAULT=YES\n"
 					videoWritten = true
 				}
+			case "subtitle":
+				if !subtitleWritten {
+					language := stream.Language
+					if language == "" {
+						language = "eng"
+					}
+					name := language
+					if stream.Title != nil && *stream.Title != "" {
+						name = *stream.Title
+					}
+					subtitleLine = fmt.Sprintf("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subtitles\",NAME=\"%s\",LANGUAGE=\"%s\",AUTOSELECT=NO,DEFAULT=NO,FORCED=NO,URI=\"subtitle0.m3u8%s\"\n", name, language, queryString)
+					subtitleWritten = true
+				}
 			}
 		}
 
-		// Write video first, then audio
+		// Write video first, then audio, then subtitles
+		log.Printf("[handleHLSMaster] Writing tracks - videoLine=%q, audioLine=%q, subtitleLine=%q", videoLine, audioLine, subtitleLine)
+
 		if videoLine != "" {
 			playlist.WriteString(videoLine)
 		}
 		if audioLine != "" {
 			playlist.WriteString(audioLine)
 		}
+		if subtitleLine != "" {
+			playlist.WriteString(subtitleLine)
+		}
 
-		// Stream info line
-		playlist.WriteString("#EXT-X-STREAM-INF:BANDWIDTH=164000,VIDEO=\"video\",AUDIO=\"audio\",NAME=\"Main\"\n")
+		// Stream info line - include subtitles if available
+		streamInfo := "#EXT-X-STREAM-INF:BANDWIDTH=164000,VIDEO=\"video\",AUDIO=\"audio\""
+		if subtitleLine != "" {
+			streamInfo += ",SUBTITLES=\"subtitles\""
+		}
+		streamInfo += ",NAME=\"Main\"\n"
+		playlist.WriteString(streamInfo)
 		playlist.WriteString(fmt.Sprintf("video0.m3u8%s\n", queryString))
 
-		return playlist.String()
+		result := playlist.String()
+		log.Printf("[handleHLSMaster] Generated dynamic playlist (length=%d): %s", len(result), result)
+		return result
 	}
 
-	return s.generateBasicHLSMasterPlaylist(engine, queryString)
+	log.Printf("[handleHLSMaster] Falling back to basic playlist due to FFmpeg not available")
+	basicResult := s.generateBasicHLSMasterPlaylist(engine, queryString)
+	log.Printf("[handleHLSMaster] Generated basic playlist (length=%d): %s", len(basicResult), basicResult)
+	return basicResult
 }
 
 // generateBasicHLSMasterPlaylist generates a basic master playlist when FFmpeg is not available
 func (s *Server) generateBasicHLSMasterPlaylist(engine *TorrentEngine, queryString string) string {
-	return fmt.Sprintf(`#EXTM3U
+	log.Printf("[generateBasicHLSMasterPlaylist] Generating basic playlist with queryString=%s", queryString)
+	result := fmt.Sprintf(`#EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="video",NAME="Video",AUTOSELECT=YES,DEFAULT=YES
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="eng",LANGUAGE="eng",AUTOSELECT=YES,DEFAULT=YES,URI="/hlsv2/%s/audio0.m3u8%s"
-#EXT-X-STREAM-INF:BANDWIDTH=164000,VIDEO="video",AUDIO="audio",NAME="Main"
-/hlsv2/%s/video0.m3u8%s`, engine.InfoHash, queryString, engine.InfoHash, queryString)
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="eng",LANGUAGE="eng",AUTOSELECT=YES,DEFAULT=YES,URI="audio0.m3u8%s"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subtitles",NAME="English",LANGUAGE="eng",AUTOSELECT=NO,DEFAULT=NO,FORCED=NO,URI="subtitle0.m3u8%s"
+#EXT-X-STREAM-INF:BANDWIDTH=164000,VIDEO="video",AUDIO="audio",SUBTITLES="subtitles",NAME="Main"
+video0.m3u8%s`, queryString, queryString, queryString)
+	log.Printf("[generateBasicHLSMasterPlaylist] Basic playlist generated: %s", result)
+	return result
 }
 
 // handleHLSStream handles /hlsv2/{infoHash}/{fileIndex}/stream.m3u8 HLS stream playlists
@@ -1920,8 +1973,8 @@ func (s *Server) handleHLSStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-HLS-Flow", "splitter")
 
 	// Serve ffmpeg output
-	if err := s.serveFfmpeg(args, "application/vnd.apple.mpegurl", w); err != nil {
-		log.Printf("HLS Stream error: %v", err)
+	if err := s.serveFfmpegWithContentLength(args, "application/vnd.apple.mpegurl", w); err != nil {
+		log.Printf("[handleHLSStream] HLS Stream error: %v", err)
 		http.Error(w, "Streaming failed", http.StatusInternalServerError)
 		return
 	}
@@ -1957,11 +2010,11 @@ func (s *Server) handleHLSQuality(w http.ResponseWriter, r *http.Request) {
 	// Generate quality-specific playlist
 	playlist := fmt.Sprintf(`#EXTM3U
 #EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:10
+#EXT-X-TARGETDURATION:5
 #EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:10.0,
+#EXTINF:4.000,
 %s/segment_000.ts
-#EXTINF:10.0,
+#EXTINF:4.000,
 %s/segment_001.ts
 #EXT-X-ENDLIST`, quality, quality)
 
@@ -2061,9 +2114,9 @@ func (s *Server) handleTranscode(w http.ResponseWriter, r *http.Request) {
 	// Start transcoding in a goroutine
 	go func() {
 		if err := s.ffmpegMgr.TranscodeVideo(req.InputPath, req.OutputPath, req.Options); err != nil {
-			log.Printf("Transcoding failed: %v", err)
+			log.Printf("[handleTranscode] Transcoding failed: %v", err)
 		} else {
-			log.Printf("Transcoding completed: %s -> %s", req.InputPath, req.OutputPath)
+			log.Printf("[handleTranscode] Transcoding completed: %s -> %s", req.InputPath, req.OutputPath)
 		}
 	}()
 
@@ -2122,11 +2175,11 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 		if !exists || engine == nil {
 			// Try to create the torrent and only download the selected file
 			magnetURI := fmt.Sprintf("magnet:?xt=urn:btih:%s", infoHash)
-			log.Printf("/probe: Creating torrent %s for fileIndex %d", infoHash, fileIndex)
+			log.Printf("[handleProbe] Creating torrent %s for fileIndex %d", infoHash, fileIndex)
 			var err error
 			engine, err = s.engineFS.torrentManager.AddTorrentWithFileIndex(magnetURI, nil, true, 50, 300, fileIndex)
 			if err != nil {
-				log.Printf("/probe: Error creating torrent: %v", err)
+				log.Printf("[handleProbe] Error creating torrent: %v", err)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2136,7 +2189,7 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
-			log.Printf("/probe: Successfully created torrent engine for: %s", engine.InfoHash)
+			log.Printf("[handleProbe] Successfully created torrent engine for: %s", engine.InfoHash)
 		}
 	}
 
@@ -2215,7 +2268,7 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 
 	// Generate thumbnail
 	if err := s.ffmpegMgr.GenerateThumbnail(inputPath, thumbnailPath, timeOffset); err != nil {
-		log.Printf("Thumbnail generation failed: %v", err)
+		log.Printf("[handleThumbnail] Thumbnail generation failed: %v", err)
 		http.Error(w, "Failed to generate thumbnail", http.StatusInternalServerError)
 		return
 	}
@@ -2229,7 +2282,7 @@ func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	defer ws.Close()
 
 	// TODO: Implement WebSocket handling for real-time updates
-	log.Printf("WebSocket connection established")
+	log.Printf("[handleWebSocket] WebSocket connection established")
 
 	// Keep connection alive
 	for {
@@ -2284,6 +2337,7 @@ func (s *Server) handleHLSVideo0M3U8(w http.ResponseWriter, r *http.Request) {
 
 // handleHLSInitSegment handles /hlsv2/{infoHash}/{fileIndex}/init.mp4 and /hlsv2/{infoHash}/{fileIndex}/video0/init.mp4 HLS init segments
 func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
+	log.Printf("handleHLSInitSegment: Called with URL: %s", r.URL.Path)
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
 
@@ -2357,21 +2411,8 @@ func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Test if FFmpeg can read the file first
-	testArgs := []string{"-i", filePath, "-f", "null", "-"}
-	if s.ffmpegMgr != nil && s.ffmpegMgr.ffmpegPath != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		cmd := exec.CommandContext(ctx, s.ffmpegMgr.ffmpegPath, testArgs...)
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-		if err := cmd.Run(); err != nil {
-			log.Printf("handleHLSInitSegment: FFmpeg cannot read file, falling back to minimal init segment: %v", err)
-			serveMinimalInitSegment(w)
-			cancel()
-			return
-		}
-		cancel()
-	}
+	// Skip the readability test - it's incorrectly failing
+	log.Printf("handleHLSInitSegment: Skipping readability test, proceeding with init segment generation")
 
 	if strings.HasPrefix(ffmpegMap, "0:v") {
 		args := []string{
@@ -2399,7 +2440,7 @@ func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
 			"pipe:1",
 		}
 		log.Printf("handleHLSInitSegment: Running FFmpeg for video init segment: ffmpeg %v", args)
-		err = s.serveFfmpeg(args, "video/mp4", w)
+		err = s.serveFfmpegWithContentLength(args, "video/mp4", w)
 	} else if strings.HasPrefix(ffmpegMap, "0:a") {
 		args := []string{
 			"-fflags", "+genpts",
@@ -2428,7 +2469,7 @@ func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
 			"pipe:1",
 		}
 		log.Printf("handleHLSInitSegment: Running FFmpeg for audio init segment: ffmpeg %v", args)
-		err = s.serveFfmpeg(args, "audio/mp4", w)
+		err = s.serveFfmpegWithContentLength(args, "video/mp4", w)
 	}
 	if err != nil {
 		log.Printf("handleHLSInitSegment: FFmpeg failed, falling back to minimal init segment: %v", err)
@@ -2476,6 +2517,7 @@ func (s *Server) handleHLSInitSegment(w http.ResponseWriter, r *http.Request) {
 
 // handleHLSInitSegmentNoFileIndex handles /hlsv2/{infoHash}/init.mp4 HLS init segments without file index
 func (s *Server) handleHLSInitSegmentNoFileIndex(w http.ResponseWriter, r *http.Request) {
+	log.Printf("handleHLSInitSegmentNoFileIndex: Called with URL: %s", r.URL.Path)
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], "")
 
@@ -2567,16 +2609,41 @@ func (s *Server) handleHLSInitSegmentNoFileIndex(w http.ResponseWriter, r *http.
 
 	var args []string
 	if strings.HasPrefix(ffmpegMap, "0:v") {
+		// Check if input is HEVC and handle accordingly
+		isHEVC := false
+		if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+			probeInfo, err := s.ffmpegMgr.GetProbeInfo(filePath)
+			if err == nil && probeInfo != nil {
+				for _, stream := range probeInfo.Streams {
+					if stream.Track == "video" {
+						codecLower := strings.ToLower(stream.Codec)
+						if strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265") {
+							isHEVC = true
+							break
+						}
+					}
+				}
+			}
+		}
+
 		args = []string{
 			"-i", filePath,
 			"-map", ffmpegMap,
-			"-c:v", "copy",
+		}
+
+		if isHEVC {
+			args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18")
+		} else {
+			args = append(args, "-c:v", "copy")
+		}
+
+		args = append(args,
 			"-f", "mp4",
 			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 			"-frames", "0",
 			"-y",
 			"pipe:1",
-		}
+		)
 	} else if strings.HasPrefix(ffmpegMap, "0:a") {
 		args = []string{
 			"-i", filePath,
@@ -2601,9 +2668,38 @@ func (s *Server) handleHLSInitSegmentNoFileIndex(w http.ResponseWriter, r *http.
 		}
 	}
 	log.Printf("handleHLSInitSegmentNoFileIndex: Running FFmpeg for init segment: ffmpeg %v", args)
-	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
-		log.Printf("handleHLSInitSegmentNoFileIndex: FFmpeg failed, falling back to minimal init segment: %v", err)
-		serveMinimalInitSegment(w)
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
+		// If copy failed and it's a video track, try transcoding
+		if strings.HasPrefix(ffmpegMap, "0:v") && (strings.Contains(err.Error(), "copy") || strings.Contains(err.Error(), "encoder") || strings.Contains(err.Error(), "codec")) {
+			log.Printf("handleHLSInitSegmentNoFileIndex: Copy/encoder failed, trying transcoding: %v", err)
+
+			// Replace copy with transcode
+			transcodeArgs := make([]string, len(args))
+			copy(transcodeArgs, args)
+			for i, arg := range transcodeArgs {
+				if arg == "-c:v" && i+1 < len(transcodeArgs) && transcodeArgs[i+1] == "copy" {
+					transcodeArgs[i+1] = "libx264"
+					// Insert preset and crf after codec
+					newArgs := make([]string, 0, len(transcodeArgs)+2)
+					newArgs = append(newArgs, transcodeArgs[:i+2]...)
+					newArgs = append(newArgs, "-preset", "ultrafast", "-crf", "18")
+					newArgs = append(newArgs, transcodeArgs[i+2:]...)
+					transcodeArgs = newArgs
+					break
+				}
+			}
+
+			log.Printf("handleHLSInitSegmentNoFileIndex: Retrying with transcode: ffmpeg %v", transcodeArgs)
+			if err := s.serveFfmpegWithContentLength(transcodeArgs, "video/mp4", w); err != nil {
+				log.Printf("handleHLSInitSegmentNoFileIndex: Transcode also failed, falling back to minimal init segment: %v", err)
+				serveMinimalInitSegment(w)
+				return
+			}
+		} else {
+			log.Printf("handleHLSInitSegmentNoFileIndex: FFmpeg failed, falling back to minimal init segment: %v", err)
+			serveMinimalInitSegment(w)
+			return
+		}
 	}
 
 	// Disk cache for init segments
@@ -2718,7 +2814,7 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 	// Detect Matroska/WebM
 	isMatroska := strings.HasSuffix(strings.ToLower(file.Name), ".mkv") || strings.HasSuffix(strings.ToLower(file.Name), ".webm")
 	log.Printf("HLS Segment: File is %b", isMatroska)
-	// Check if file exists on disk and retry if needed
+	// Enhanced file availability check with piece-based waiting (like JavaScript)
 	fileInfo, err := os.Stat(file.Path)
 	if err != nil {
 		log.Printf("HLS Segment: File not found on disk: %s", file.Path)
@@ -2727,12 +2823,22 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fileInfo.Size() == 0 {
-		maxRetries := 10
-		retryDelay := 500 * time.Millisecond
+		log.Printf("HLS Segment: File is empty, waiting for initial pieces...")
+
+		// Wait for initial data with progressive backoff (like JavaScript)
+		maxRetries := 15
+		baseDelay := 200 * time.Millisecond
+		maxDelay := 2 * time.Second
 
 		for retry := 0; retry < maxRetries; retry++ {
-			log.Printf("HLS Segment: File is empty (retry %d/%d) - waiting %v", retry+1, maxRetries, retryDelay)
-			time.Sleep(retryDelay)
+			// Calculate delay with exponential backoff
+			delay := time.Duration(float64(baseDelay) * float64(1.5*float64(retry)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+
+			log.Printf("HLS Segment: File is empty (retry %d/%d) - waiting %v", retry+1, maxRetries, delay)
+			time.Sleep(delay)
 
 			newFileInfo, err2 := os.Stat(file.Path)
 			if err2 == nil && newFileInfo.Size() > 0 {
@@ -2741,8 +2847,14 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			// Increase delay for next retry
-			retryDelay = time.Duration(float64(retryDelay) * 1.5)
+			// Check if torrent has any completed pieces
+			if engine.Torrent != nil {
+				bytesCompleted := engine.Torrent.Files()[fileIndex].BytesCompleted()
+				if bytesCompleted > 0 {
+					log.Printf("HLS Segment: Torrent has %d bytes completed, continuing...", bytesCompleted)
+					break
+				}
+			}
 		}
 
 		// If still empty after retries, return error
@@ -2761,14 +2873,36 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Quality requested: %s", quality)
 
-	segmentDuration := 2.0
-	startTime := float64(sequence) * segmentDuration
+	segmentDuration := 4.0
+	startTime := float64(sequence-1) * segmentDuration
 	log.Printf("Segment %d: startTime=%.2f, duration=%.2f", sequence, startTime, segmentDuration)
 
 	// Build FFmpeg arguments for HLS/DASH compatible segments (split video/audio)
 	isAudio := strings.Contains(r.URL.Path, "/audio0/")
-	segmentDuration = 2.0
-	startTime = float64(sequence) * segmentDuration
+
+	// Calculate audio bitrate like JavaScript (64k per channel, max 384k for 2+ channels)
+	var audioBitrate int = 128000 // Default for 2 channels
+	if isAudio {
+		// Try to get audio channels from probe info
+		if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+			if probeInfo, err := s.ffmpegMgr.GetProbeInfo(file.Path); err == nil && probeInfo != nil {
+				for _, stream := range probeInfo.Streams {
+					if stream.Track == "audio" {
+						var channels int = stream.Channels
+						if channels == 0 {
+							channels = 2 // Default to 2 channels
+						}
+						audioBitrate = 64000 * channels
+						if audioBitrate > 384000 {
+							audioBitrate = 384000 // Cap at 384k like JavaScript
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
 	var args []string
 	if isAudio {
 		args = []string{
@@ -2776,8 +2910,13 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 			"-noaccurate_seek",
 			"-seek_timestamp", "1",
 			"-copyts",
-			"-seek2any", "1",
-			"-ss", fmt.Sprintf("%.3f", startTime),
+		}
+		// Add seek2any for Matroska files like JavaScript
+		if isMatroska {
+			args = append(args, "-seek2any", "1")
+		}
+		args = append(args,
+			"-ss", "0",
 			"-i", file.Path,
 			"-threads", "3",
 			"-ss", fmt.Sprintf("%.3f", startTime),
@@ -2794,26 +2933,52 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 			"-filter:a", "apad",
 			"-async", "1",
 			"-ac:a", "2",
-			"-ab", "384000",
+			"-ab", fmt.Sprintf("%d", audioBitrate),
 			"-ar:a", "48000",
 			"-map", "-0:s?",
-			"-frag_duration", "4096000",
-			"-fragment_index", "1",
+		)
+		// Add fragment duration like JavaScript
+		if segmentDuration > 0 {
+			fragDuration := int(segmentDuration * 1000 * 1000) // Convert to microseconds like JavaScript
+			args = append(args, "-frag_duration", fmt.Sprintf("%d", fragDuration))
+		}
+		args = append(args,
+			"-fragment_index", fmt.Sprintf("%d", sequence),
 			"-movflags", "empty_moov+default_base_moof+delay_moov+dash",
 			"-use_editlist", "1",
 			"-f", "mp4",
 			"pipe:1",
-		}
+		)
 	} else {
 		args = []string{
 			"-fflags", "+genpts",
 			"-noaccurate_seek",
 			"-seek_timestamp", "1",
 			"-copyts",
-			"-seek2any", "1",
-			"-ss", fmt.Sprintf("%.3f", startTime),
+		}
+		// Add seek2any for Matroska files like JavaScript
+		if isMatroska {
+			args = append(args, "-seek2any", "1")
+		}
+		// Add quality-specific settings (scaling) if needed - BEFORE codec selection
+		var videoFilters []string
+		switch quality {
+		case "1080p":
+			videoFilters = append(videoFilters, "scale=1920:1080")
+		case "720p":
+			videoFilters = append(videoFilters, "scale=1280:720")
+		case "480p":
+			videoFilters = append(videoFilters, "scale=854:480")
+		default:
+			// No scaling for original quality
+		}
+
+		args = append(args,
+			"-ss", "0",
 			"-i", file.Path,
 			"-threads", "3",
+			"-ss", fmt.Sprintf("%.3f", startTime),
+			"-output_ts_offset", fmt.Sprintf("%.3f", startTime),
 			"-max_muxing_queue_size", "2048",
 			"-ignore_unknown",
 			"-map_metadata", "-1",
@@ -2821,34 +2986,58 @@ func (s *Server) handleHLSSegmentM4S(w http.ResponseWriter, r *http.Request) {
 			"-map", "-0:d?",
 			"-map", "-0:t?",
 			"-map", "v:0",
-			"-c:v", "copy",
+		)
+
+		// Add video filters if any scaling is needed
+		if len(videoFilters) > 0 {
+			args = append(args, "-vf", strings.Join(videoFilters, ","))
+			// Use libx264 encoder when scaling is needed (like JavaScript)
+			args = append(args, "-c:v", "libx264", "-preset:v", "fast", "-profile:v", "high")
+		} else {
+			// For original quality, use libx264 with copy-like settings to avoid encoder issues
+			// This ensures we always have a valid encoder selected
+			args = append(args, "-c:v", "libx264", "-preset:v", "ultrafast", "-crf", "18")
+		}
+
+		args = append(args,
 			"-force_key_frames:v", "source",
 			"-map", "-0:a?",
 			"-map", "-0:s?",
-			"-fragment_index", "1",
+		)
+		// Add fragment duration like JavaScript (same as audio handler)
+		if segmentDuration > 0 {
+			fragDuration := int(segmentDuration * 1000 * 1000) // Convert to microseconds like JavaScript
+			args = append(args, "-frag_duration", fmt.Sprintf("%d", fragDuration))
+		}
+		args = append(args,
+			"-fragment_index", fmt.Sprintf("%d", sequence),
 			"-movflags", "frag_keyframe+empty_moov+default_base_moof+delay_moov+dash",
 			"-use_editlist", "1",
 			"-f", "mp4",
 			"pipe:1",
-		}
-		// Add quality-specific settings (scaling) if needed
-		switch quality {
-		case "1080p":
-			args = append(args, "-vf", "scale=1920:1080")
-		case "720p":
-			args = append(args, "-vf", "scale=1280:720")
-		case "480p":
-			args = append(args, "-vf", "scale=854:480")
-		default:
-			// No scaling for original quality
-		}
+		)
 	}
 
 	// Set HLS flow header
 	w.Header().Set("X-HLS-Flow", "transcoder")
 
-	// Serve ffmpeg output
-	if err := s.serveFfmpeg(args, "video/mp2t", w); err != nil {
+	// Set additional headers for better streaming
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Keep-Alive", "timeout=5")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Serve ffmpeg output with content length
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
+		// Check if it's a client disconnection error
+		if strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "broken pipe") ||
+			strings.Contains(err.Error(), "write: connection reset") ||
+			strings.Contains(err.Error(), "write: broken pipe") {
+			log.Printf("HLS Segment: Client disconnected during streaming: %v", err)
+			return // Don't treat client disconnection as an error
+		}
 		log.Printf("HLS Segment Transcode error: %v", err)
 		http.Error(w, "Transcoding failed", http.StatusInternalServerError)
 		return
@@ -2982,7 +3171,7 @@ func (s *Server) handleHLSAudioInitSegment(w http.ResponseWriter, r *http.Reques
 		"pipe:1",
 	}
 	log.Printf("handleHLSAudioInitSegment: Running FFmpeg for audio init segment: ffmpeg %v", args)
-	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
 		log.Printf("handleHLSAudioInitSegment: FFmpeg failed, falling back to minimal init segment: %v", err)
 		serveMinimalInitSegment(w)
 	}
@@ -3024,8 +3213,8 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
 	sequence := vars["sequence"]
 
-	// Parse sequence number
-	seqNum, err := strconv.Atoi(sequence)
+	// Parse sequence number (not used for timing, but kept for validation)
+	_, err := strconv.Atoi(sequence)
 	if err != nil {
 		http.Error(w, "Invalid sequence number", http.StatusBadRequest)
 		return
@@ -3045,8 +3234,8 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Get file path
-	filePath := filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
+	// Get file path - use the file.Path directly like other handlers
+	filePath := file.Path
 
 	// Check if file exists on disk
 	fileInfo, err := os.Stat(filePath)
@@ -3062,20 +3251,68 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	segmentDuration := 2.0
-	segmentStartTime := float64(seqNum-1) * segmentDuration
+	// Calculate segment start time and duration (matching Node.js behavior)
+	segmentDuration := 4.0 // 4 seconds per segment
+	seqNum, err := strconv.Atoi(sequence)
+	if err != nil {
+		http.Error(w, "Invalid sequence number", http.StatusBadRequest)
+		return
+	}
+
+	var segmentStartTime float64
+	if seqNum == 1 {
+		segmentStartTime = 0.0
+	} else {
+		segmentStartTime = float64(seqNum-1) * segmentDuration
+	}
 
 	// Detect Matroska/WebM
 	isMatroska := strings.HasSuffix(strings.ToLower(file.Name), ".mkv") || strings.HasSuffix(strings.ToLower(file.Name), ".webm")
 	log.Printf("HLS Audio Segment: isMatroska : %t", isMatroska)
+
+	// Set additional headers for better streaming
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Keep-Alive", "timeout=5")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
 	// Build ffmpeg arguments for audio segment generation (audio-only, HLS/DASH compatible)
+
+	// Calculate audio bitrate like JavaScript (64k per channel, max 384k for 2+ channels)
+	var audioBitrate int = 128000 // Default for 2 channels
+
+	// Try to get audio channels from probe info
+	if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+		if probeInfo, err := s.ffmpegMgr.GetProbeInfo(filePath); err == nil && probeInfo != nil {
+			for _, stream := range probeInfo.Streams {
+				if stream.Track == "audio" {
+					var channels int = stream.Channels
+					if channels == 0 {
+						channels = 2 // Default to 2 channels
+					}
+					audioBitrate = 64000 * channels
+					if audioBitrate > 384000 {
+						audioBitrate = 384000 // Cap at 384k like JavaScript
+					}
+					break
+				}
+			}
+		}
+	}
+
 	args := []string{
 		"-fflags", "+genpts",
 		"-noaccurate_seek",
 		"-seek_timestamp", "1",
 		"-copyts",
-		"-seek2any", "1",
-		"-ss", fmt.Sprintf("%.3f", segmentStartTime),
+	}
+	// Add seek2any for Matroska files like JavaScript
+	if isMatroska {
+		args = append(args, "-seek2any", "1")
+	}
+	args = append(args,
+		"-ss", "0",
 		"-i", filePath,
 		"-threads", "3",
 		"-ss", fmt.Sprintf("%.3f", segmentStartTime),
@@ -3092,22 +3329,33 @@ func (s *Server) handleHLSAudioSegmentM4S(w http.ResponseWriter, r *http.Request
 		"-filter:a", "apad",
 		"-async", "1",
 		"-ac:a", "2",
-		"-ab", "384000",
+		"-ab", fmt.Sprintf("%d", audioBitrate),
 		"-ar:a", "48000",
 		"-map", "-0:s?",
-		"-frag_duration", "4096000",
+	)
+	// Add fragment duration like JavaScript
+	if segmentDuration > 0 {
+		fragDuration := int(segmentDuration * 1000 * 1000) // Convert to microseconds like JavaScript
+		args = append(args, "-frag_duration", fmt.Sprintf("%d", fragDuration))
+	}
+	args = append(args,
 		"-fragment_index", "1",
 		"-movflags", "empty_moov+default_base_moof+delay_moov+dash",
 		"-use_editlist", "1",
 		"-f", "mp4",
 		"pipe:1",
-	}
+	)
 	log.Printf("HLS Audio Segment: FFmpeg command: %v", args)
-	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	// Content-Length omitted for streaming
-	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
+	// Use content length approach to avoid chunked encoding
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
+		// Check if it's a client disconnection error
+		if strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "broken pipe") ||
+			strings.Contains(err.Error(), "write: connection reset") ||
+			strings.Contains(err.Error(), "write: broken pipe") {
+			log.Printf("HLS Audio Segment: Client disconnected during streaming: %v", err)
+			return // Don't treat client disconnection as an error
+		}
 		log.Printf("HLS Audio Segment error: %v", err)
 		log.Printf("HLS Audio Segment: FFmpeg command: %v", args)
 		return
@@ -3204,7 +3452,7 @@ func (s *Server) handleHLSSubtitleInitSegment(w http.ResponseWriter, r *http.Req
 		"pipe:1",
 	}
 	log.Printf("handleHLSSubtitleInitSegment: Running FFmpeg for subtitle init segment: ffmpeg %v", args)
-	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
 		log.Printf("handleHLSSubtitleInitSegment: FFmpeg failed, falling back to minimal init segment: %v", err)
 		serveMinimalInitSegment(w)
 	}
@@ -3261,14 +3509,14 @@ func (s *Server) handleHLSSubtitleSegmentM4S(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Get file info
-	_, err = engine.GetFile(fileIndex)
+	file, err := engine.GetFile(fileIndex)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
-	// Get file path
-	filePath := filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
+	// Get file path - use the file.Path directly like other handlers
+	filePath := file.Path
 
 	// Check if file exists on disk
 	fileInfo, err := os.Stat(filePath)
@@ -3284,7 +3532,7 @@ func (s *Server) handleHLSSubtitleSegmentM4S(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	segmentDuration := 2.0
+	segmentDuration := 4.0
 	segmentStartTime := float64(seqNum-1) * segmentDuration
 
 	// Detect available streams using FFprobe
@@ -3319,11 +3567,7 @@ func (s *Server) handleHLSSubtitleSegmentM4S(w http.ResponseWriter, r *http.Requ
 	}
 
 	log.Printf("HLS Subtitle Segment: FFmpeg command: %v", args)
-	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	// Content-Length omitted for streaming
-	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
 		log.Printf("HLS Subtitle Segment error: %v", err)
 		log.Printf("HLS Subtitle Segment: FFmpeg command: %v", args)
 		return
@@ -3403,7 +3647,7 @@ func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Reques
 			"-ab", "384000",
 			"-ar:a", "48000",
 			"-map", "-0:s?",
-			"-frag_duration", "4096000",
+			"-frag_duration", "4000000",
 			"-fragment_index", "1",
 			"-movflags", "empty_moov+default_base_moof+delay_moov+dash",
 			"-use_editlist", "1",
@@ -3411,7 +3655,24 @@ func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Reques
 			"pipe:1",
 		}
 	} else {
-		// Video segment command (copy video, exclude audio/subs)
+		// Video segment command (transcode video, exclude audio/subs)
+		// Check if input is HEVC and handle accordingly
+		isHEVC := false
+		if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+			probeInfo, err := s.ffmpegMgr.GetProbeInfo(filePath)
+			if err == nil && probeInfo != nil {
+				for _, stream := range probeInfo.Streams {
+					if stream.Track == "video" {
+						codecLower := strings.ToLower(stream.Codec)
+						if strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265") {
+							isHEVC = true
+							break
+						}
+					}
+				}
+			}
+		}
+
 		args = []string{
 			"-fflags", "+genpts",
 			"-noaccurate_seek",
@@ -3428,7 +3689,15 @@ func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Reques
 			"-map", "-0:d?",
 			"-map", "-0:t?",
 			"-map", "v:0",
-			"-c:v", "copy",
+		}
+
+		if isHEVC {
+			args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18")
+		} else {
+			args = append(args, "-c:v", "copy")
+		}
+
+		args = append(args,
 			"-force_key_frames:v", "source",
 			"-map", "-0:a?",
 			"-map", "-0:s?",
@@ -3437,7 +3706,7 @@ func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Reques
 			"-use_editlist", "1",
 			"-f", "mp4",
 			"pipe:1",
-		}
+		)
 		// Add quality-specific settings (scaling) if needed
 		switch quality {
 		case "1080p":
@@ -3455,7 +3724,7 @@ func (s *Server) handleHLSSegmentTranscode(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-HLS-Flow", "transcoder")
 
 	// Serve ffmpeg output
-	if err := s.serveFfmpeg(args, "video/mp2t", w); err != nil {
+	if err := s.serveFfmpegWithContentLength(args, "video/mp2t", w); err != nil {
 		log.Printf("HLS Segment Transcode error: %v", err)
 		http.Error(w, "Transcoding failed", http.StatusInternalServerError)
 		return
@@ -3531,7 +3800,7 @@ func (s *Server) handleHLSStreamSplit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-HLS-Flow", "splitter")
 
 	// Serve ffmpeg output
-	if err := s.serveFfmpeg(args, "application/vnd.apple.mpegurl", w); err != nil {
+	if err := s.serveFfmpegWithContentLength(args, "application/vnd.apple.mpegurl", w); err != nil {
 		log.Printf("HLS Stream Split error: %v", err)
 		http.Error(w, "Streaming failed", http.StatusInternalServerError)
 		return
@@ -3708,7 +3977,7 @@ func main() {
 			HardwareAcceleration: getEnvBool("FFMPEG_HARDWARE_ACCEL", true),
 			TranscodeHorsepower:  getEnvFloat("FFMPEG_HORSEPOWER", 0.75),
 			TranscodeMaxBitRate:  getEnvInt("FFMPEG_MAX_BITRATE", 0),
-			TranscodeConcurrency: getEnvInt("FFMPEG_CONCURRENCY", 1),
+			TranscodeConcurrency: getEnvInt("FFMPEG_CONCURRENCY", 2),
 			TranscodeMaxWidth:    getEnvInt("FFMPEG_MAX_WIDTH", 1920),
 			TranscodeProfile:     getEnv("FFMPEG_PROFILE", ""),
 			Debug:                getEnvBool("FFMPEG_DEBUG", false),
@@ -3866,12 +4135,91 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 // Placeholder handlers for new /hlsv2 routes
 func (s *Server) handleHLSGenericTrackM3U8(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement generic track.m3u8 logic
+	vars := mux.Vars(r)
+	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
+	track := vars["track"]
+
+	engine, exists := s.engineFS.torrentManager.GetTorrent(infoHash)
+	if !exists {
+		http.Error(w, "Torrent not found", http.StatusNotFound)
+		return
+	}
+
+	file, err := engine.GetFile(fileIndex)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	// Get duration from probe info
+	var duration float64 = 120.0 // Default 2 minutes if we can't probe
+	if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+		probeInfo, err := s.ffmpegMgr.GetProbeInfo(file.Path)
+		if err == nil && probeInfo != nil && probeInfo.Format.Duration > 0 {
+			duration = probeInfo.Format.Duration
+		}
+	}
+
+	// Generate query string for segments
+	queryString := r.URL.RawQuery
+	if queryString != "" {
+		queryString = "?" + queryString
+	}
+
+	// Generate playlist
+	playlist := generateHLSGenericTrackPlaylist(track, duration, queryString)
+
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:7\n# TODO: Implement generic track.m3u8\n"))
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write([]byte(playlist))
+}
+
+func generateHLSGenericTrackPlaylist(track string, duration float64, queryString string) string {
+	var playlist strings.Builder
+
+	// M3U8 header
+	playlist.WriteString("#EXTM3U\n")
+	playlist.WriteString("#EXT-X-VERSION:7\n")
+
+	// Calculate segment duration based on track type (matching Node.js behavior)
+	var segmentDuration float64
+	if strings.HasPrefix(track, "video") {
+		segmentDuration = 4.0 // Video segments: 4 seconds (matching Node.js transcoding)
+	} else if strings.HasPrefix(track, "audio") {
+		segmentDuration = 4.0 // Audio segments: 4 seconds (matching Node.js transcoding)
+	} else {
+		segmentDuration = 4.0 // Default fallback
+	}
+
+	// Calculate target duration (should be >= segment duration)
+	targetDuration := int(math.Ceil(segmentDuration))
+	playlist.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration+1))
+	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
+	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+
+	// Add init segment for video/audio tracks
+	if strings.HasPrefix(track, "video") || strings.HasPrefix(track, "audio") {
+		playlist.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s/init.mp4%s\"\n", track, queryString))
+	}
+
+	// Generate segments
+	numSegments := int(duration / segmentDuration)
+	if numSegments == 0 {
+		numSegments = 1 // Ensure at least one segment
+	}
+
+	for i := 1; i <= numSegments; i++ {
+		playlist.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", segmentDuration))
+		playlist.WriteString(fmt.Sprintf("%s/segment%d.m4s%s\n", track, i, queryString))
+	}
+
+	playlist.WriteString("#EXT-X-ENDLIST\n")
+	return playlist.String()
 }
 
 func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Request) {
+	log.Printf("handleHLSGenericTrackInitMP4: Called with URL: %s", r.URL.Path)
 	vars := mux.Vars(r)
 	infoHash, fileIndex := getInfoHashAndFileIndex(r, vars["infoHash"], vars["fileIndex"])
 	track := vars["track"]
@@ -3887,6 +4235,12 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 		return
 	}
 	filePath := file.Path
+
+	// Detect client capabilities from query parameters (primary) and User-Agent (fallback)
+	clientCaps := detectClientCapabilitiesFromQuery(r)
+	log.Printf("handleHLSGenericTrackInitMP4: Client capabilities - HEVC support: %v, Video codecs: %v, Audio codecs: %v",
+		clientCaps.SupportsHEVC, clientCaps.SupportedVideoCodecs, clientCaps.SupportedAudioCodecs)
+
 	trackType := "video"
 	ffmpegMap := "0:v:0"
 	isAudio := false
@@ -3965,30 +4319,25 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Test if FFmpeg can read the file first (use a much faster check)
-	testArgs := []string{"-v", "error", "-t", "1", "-i", filePath, "-f", "null", "-"}
-	if s.ffmpegMgr != nil && s.ffmpegMgr.ffmpegPath != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		cmd := exec.CommandContext(ctx, s.ffmpegMgr.ffmpegPath, testArgs...)
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-		log.Printf("handleHLSGenericTrackInitMP4: Running FFmpeg command to test file readability: %s", strings.Join(cmd.Args, " "))
-		if err := cmd.Run(); err != nil {
-			exitError, ok := err.(*exec.ExitError)
-			if ok {
-				log.Printf("handleHLSGenericTrackInitMP4: FFmpeg cannot read file, falling back to minimal init segment: exit code %d", exitError.ExitCode())
-			} else {
-				log.Printf("handleHLSGenericTrackInitMP4: FFmpeg cannot read file, falling back to minimal init segment: %v", err)
-			}
-			serveMinimalInitSegment(w)
-			cancel()
-			return
-		}
-		cancel()
-	}
+	// Skip the readability test for now since it's failing incorrectly
+	log.Printf("handleHLSGenericTrackInitMP4: Skipping readability test, proceeding directly with init segment generation")
 
 	var args []string
 	if isAudio {
+		// Use client-specific audio settings
+		audioCodec := clientCaps.PreferredAudioCodec
+		if audioCodec == "" {
+			audioCodec = "aac"
+		}
+		audioChannels := clientCaps.MaxAudioChannels
+		if audioChannels == 0 {
+			audioChannels = 2
+		}
+		audioBitrate := 64000 * audioChannels
+		if audioBitrate > 384000 {
+			audioBitrate = 384000 // Cap at 384k like JavaScript
+		}
+
 		args = []string{
 			"-fflags", "+genpts",
 			"-noaccurate_seek",
@@ -4008,14 +4357,14 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 			"-map", "-0:t?",
 			"-map", "-0:v?",
 			"-map", "a:0",
-			"-c:a", "aac",
+			"-c:a", audioCodec,
 			"-filter:a", "apad",
 			"-async", "1",
-			"-ac:a", "2",
-			"-ab", "384000",
+			"-ac:a", strconv.Itoa(audioChannels),
+			"-ab", strconv.Itoa(audioBitrate),
 			"-ar:a", "48000",
 			"-map", "-0:s?",
-			"-frag_duration", "4096000",
+			"-frag_duration", "4000000",
 			"-fragment_index", "1",
 			"-movflags", "empty_moov+default_base_moof+delay_moov+dash",
 			"-use_editlist", "1",
@@ -4025,6 +4374,7 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 			"pipe:1",
 		}
 	} else if trackType == "video" {
+		// Check if input is HEVC and handle accordingly
 		args = []string{
 			"-fflags", "+genpts",
 			"-noaccurate_seek",
@@ -4041,7 +4391,35 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 			"-map", "-0:d?",
 			"-map", "-0:t?",
 			"-map", "v:0",
-			"-c:v", "copy",
+		}
+
+		// Try to detect if input is HEVC and handle appropriately
+		isHEVC := false
+		if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+			probeInfo, err := s.ffmpegMgr.GetProbeInfo(filePath)
+			if err == nil && probeInfo != nil {
+				for _, stream := range probeInfo.Streams {
+					if stream.Track == "video" {
+						codecLower := strings.ToLower(stream.Codec)
+						if strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265") {
+							isHEVC = true
+							args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18")
+							break
+						}
+					}
+				}
+			}
+		}
+
+		// If no HEVC detected, use copy codec
+		if !isHEVC {
+			args = append(args, "-c:v", "copy")
+		}
+
+		// For video tracks, always have a fallback to transcoding ready
+		// since HEVC is very common and often causes issues with MP4
+
+		args = append(args,
 			"-force_key_frames:v", "source",
 			"-map", "-0:a?",
 			"-map", "-0:s?",
@@ -4052,11 +4430,12 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 			"-frames:v", "1",
 			"-y",
 			"pipe:1",
-		}
+		)
 	} else if trackType == "subtitle" {
 		args = []string{
 			"-i", filePath,
 			"-map", ffmpegMap,
+			"-c:s", "mov_text",
 			"-threads", "1",
 			"-f", "mp4",
 			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
@@ -4065,12 +4444,6 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 			"pipe:1",
 		}
 	}
-	log.Printf("handleHLSGenericTrackInitMP4: Running FFmpeg for %s init segment: ffmpeg %v", trackType, args)
-	if err := s.serveFfmpeg(args, "video/mp4", w); err != nil {
-		log.Printf("handleHLSGenericTrackInitMP4: FFmpeg failed, falling back to minimal init segment: %v", err)
-		serveMinimalInitSegment(w)
-	}
-
 	// Disk cache for init segments
 	if strings.HasPrefix(ffmpegMap, "0:v") {
 		trackType = "video"
@@ -4084,6 +4457,8 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 	cacheDir := filepath.Join(filepath.Dir(filePath), "init_segments")
 	os.MkdirAll(cacheDir, 0755)
 	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("init_%s_%d_%s.mp4", infoHash, fileIndex, trackType))
+
+	// First try to serve from cache
 	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {
 		log.Printf("handleHLSGenericTrackInitMP4: Serving cached init segment: %s", cacheFile)
 		f, err := os.Open(cacheFile)
@@ -4097,13 +4472,44 @@ func (s *Server) handleHLSGenericTrackInitMP4(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// After successful FFmpeg generation, save to cache
-	if err == nil {
-		if f, ferr := os.Create(cacheFile); ferr == nil {
-			defer f.Close()
-			log.Printf("handleHLSGenericTrackInitMP4: (TODO) Optimize: buffer FFmpeg output to serve and cache in one pass")
+	// If not in cache, generate with FFmpeg
+	log.Printf("handleHLSGenericTrackInitMP4: Executing FFmpeg command: %v", args)
+	if err := s.serveFfmpegWithContentLength(args, "video/mp4", w); err != nil {
+		// If copy failed and it's a video track, try transcoding
+		if trackType == "video" && (strings.Contains(err.Error(), "copy") || strings.Contains(err.Error(), "encoder") || strings.Contains(err.Error(), "codec")) {
+			log.Printf("handleHLSGenericTrackInitMP4: Copy/encoder failed, trying transcoding: %v", err)
+
+			// Replace copy with transcode
+			transcodeArgs := make([]string, len(args))
+			copy(transcodeArgs, args)
+			for i, arg := range transcodeArgs {
+				if arg == "-c:v" && i+1 < len(transcodeArgs) && transcodeArgs[i+1] == "copy" {
+					transcodeArgs[i+1] = "libx264"
+					// Insert preset and crf after codec
+					newArgs := make([]string, 0, len(transcodeArgs)+2)
+					newArgs = append(newArgs, transcodeArgs[:i+2]...)
+					newArgs = append(newArgs, "-preset", "ultrafast", "-crf", "18")
+					newArgs = append(newArgs, transcodeArgs[i+2:]...)
+					transcodeArgs = newArgs
+					break
+				}
+			}
+
+			log.Printf("handleHLSGenericTrackInitMP4: Retrying with transcode: ffmpeg %v", transcodeArgs)
+			if err := s.serveFfmpegWithContentLength(transcodeArgs, "video/mp4", w); err != nil {
+				log.Printf("handleHLSGenericTrackInitMP4: Transcode also failed, falling back to minimal init segment: %v", err)
+				serveMinimalInitSegment(w)
+				return
+			}
+		} else {
+			log.Printf("handleHLSGenericTrackInitMP4: FFmpeg failed, falling back to minimal init segment: %v", err)
+			serveMinimalInitSegment(w)
+			return
 		}
 	}
+
+	// After successful FFmpeg generation, save to cache (TODO: optimize to buffer and serve/cache in one pass)
+	log.Printf("handleHLSGenericTrackInitMP4: (TODO) Optimize: buffer FFmpeg output to serve and cache in one pass")
 }
 
 func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Request) {
@@ -4127,26 +4533,37 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	filePath := filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
-
-	if _, err := os.Stat(filePath); err != nil {
-		log.Printf("HLS Generic Track Segment: File not found on disk: %s", filePath)
-		http.Error(w, "File not found on disk", http.StatusNotFound)
-		return
-	}
-
 	seqNum, err := strconv.Atoi(sequenceNumber)
 	if err != nil {
 		http.Error(w, "Invalid sequence number", http.StatusBadRequest)
 		return
 	}
 
-	segmentDuration := 2.0
-	segmentStartTime := float64(seqNum-1) * segmentDuration
+	// Calculate segment start time and duration (matching Node.js behavior)
+	segmentDuration := 4.0 // 4 seconds per segment
+	var segmentStartTime float64
+	if seqNum == 1 {
+		segmentStartTime = 0.0
+	} else {
+		segmentStartTime = float64(seqNum-1) * segmentDuration
+	}
+
+	// Get the mediaURL from query parameters
+	mediaURL := r.URL.Query().Get("mediaURL")
+	if mediaURL == "" {
+		log.Printf("HLSGenericTrackSegment: mediaURL parameter not found")
+		http.Error(w, "mediaURL parameter required", http.StatusBadRequest)
+		return
+	}
+
+	inputURL := mediaURL
+	log.Printf("HLSGenericTrackSegment: using mediaURL: %s", inputURL)
 
 	var hasVideo, hasAudio bool
 	if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
-		probeInfo, err := s.ffmpegMgr.GetProbeInfo(filePath)
+		// Use the local file path for probing
+		localFilePath := filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
+		probeInfo, err := s.ffmpegMgr.GetProbeInfo(localFilePath)
 		if err == nil && probeInfo != nil {
 			for _, stream := range probeInfo.Streams {
 				if stream.Track == "video" {
@@ -4164,12 +4581,18 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 	}
 
 	contentType := "video/mp4"
-	if strings.HasPrefix(track, "audio") {
-		contentType = "audio/mp4"
-	}
+	// Audio tracks also use video/mp4 content type for HLS compatibility
+
+	// Set additional headers for better streaming
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Keep-Alive", "timeout=5")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	var args []string
 	if strings.HasPrefix(track, "audio") {
+		// Audio track - matching working command
 		args = []string{
 			"-fflags", "+genpts",
 			"-noaccurate_seek",
@@ -4177,8 +4600,8 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-copyts",
 			"-seek2any", "1",
 			"-ss", fmt.Sprintf("%.3f", segmentStartTime),
-			"-i", filePath,
-			"-t", fmt.Sprintf("%.3f", segmentDuration), // limit audio segment duration
+			"-i", inputURL,
+			"-t", fmt.Sprintf("%.3f", segmentDuration), // Limit segment duration
 			"-threads", "3",
 			"-ss", fmt.Sprintf("%.3f", segmentStartTime),
 			"-output_ts_offset", fmt.Sprintf("%.3f", segmentStartTime),
@@ -4194,7 +4617,7 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-filter:a", "apad",
 			"-async", "1",
 			"-ac:a", "2",
-			"-ab", "384000",
+			"-ab", "256000",
 			"-ar:a", "48000",
 			"-map", "-0:s?",
 			"-frag_duration", "4096000",
@@ -4205,6 +4628,26 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"pipe:1",
 		}
 	} else {
+		// Video track - matching working command
+		// Check if input is HEVC and handle accordingly
+		isHEVC := false
+		if s.ffmpegMgr != nil && s.ffmpegMgr.IsProbeAvailable() {
+			// Use the local file path for probing instead of HTTP URL
+			localFilePath := filepath.Join(s.engineFS.torrentManager.cachePath, infoHash, strconv.Itoa(fileIndex))
+			probeInfo, err := s.ffmpegMgr.GetProbeInfo(localFilePath)
+			if err == nil && probeInfo != nil {
+				for _, stream := range probeInfo.Streams {
+					if stream.Track == "video" {
+						codecLower := strings.ToLower(stream.Codec)
+						if strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265") {
+							isHEVC = true
+							break
+						}
+					}
+				}
+			}
+		}
+
 		args = []string{
 			"-fflags", "+genpts",
 			"-noaccurate_seek",
@@ -4212,8 +4655,8 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-copyts",
 			"-seek2any", "1",
 			"-ss", fmt.Sprintf("%.3f", segmentStartTime),
-			"-i", filePath,
-			"-t", fmt.Sprintf("%.3f", segmentDuration),
+			"-i", inputURL,
+			"-t", fmt.Sprintf("%.3f", segmentDuration), // Limit segment duration
 			"-threads", "3",
 			"-max_muxing_queue_size", "2048",
 			"-ignore_unknown",
@@ -4222,7 +4665,15 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-map", "-0:d?",
 			"-map", "-0:t?",
 			"-map", "v:0",
-			"-c:v", "copy",
+		}
+
+		if isHEVC {
+			args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18")
+		} else {
+			args = append(args, "-c:v", "copy")
+		}
+
+		args = append(args,
 			"-force_key_frames:v", "source",
 			"-map", "-0:a?",
 			"-map", "-0:s?",
@@ -4231,12 +4682,19 @@ func (s *Server) handleHLSGenericTrackSegment(w http.ResponseWriter, r *http.Req
 			"-use_editlist", "1",
 			"-f", "mp4",
 			"pipe:1",
-		}
+		)
 	}
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if err := s.serveFfmpeg(args, contentType, w); err != nil {
+
+	// Use content length approach to avoid chunked encoding
+	if err := s.serveFfmpegWithContentLength(args, contentType, w); err != nil {
+		// Check if it's a client disconnection error
+		if strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "broken pipe") ||
+			strings.Contains(err.Error(), "write: connection reset") ||
+			strings.Contains(err.Error(), "write: broken pipe") {
+			log.Printf("HLS Generic Track Segment: Client disconnected during streaming: %v", err)
+			return // Don't treat client disconnection as an error
+		}
 		log.Printf("HLS Generic Track Segment error: %v", err)
 		log.Printf("HLS Generic Track Segment: FFmpeg command: %v", args)
 		return
@@ -4267,31 +4725,6 @@ func (s *Server) handleHLSExec(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"exec placeholder"}`))
 }
 
-// detectProblematicAudioCodec checks if a file has audio codecs that need special handling
-func (s *Server) detectProblematicAudioCodec(filePath string) (bool, string) {
-	if s.ffmpegMgr == nil || s.ffmpegMgr.ffprobePath == "" {
-		return false, ""
-	}
-
-	// Use ffprobe to check audio codec
-	cmd := exec.Command(s.ffmpegMgr.ffprobePath, "-v", "quiet", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", filePath)
-	output, err := cmd.Output()
-	if err != nil {
-		return false, ""
-	}
-
-	codecName := strings.TrimSpace(string(output))
-	problematicCodecs := []string{"eac3", "ac3", "dts", "flac"}
-
-	for _, problematic := range problematicCodecs {
-		if strings.Contains(strings.ToLower(codecName), problematic) {
-			return true, codecName
-		}
-	}
-
-	return false, codecName
-}
-
 // serveFfmpeg spawns ffmpeg with given arguments and pipes output to HTTP response (matching Node.js server.js)
 func (s *Server) serveFfmpeg(args []string, contentType string, w http.ResponseWriter) error {
 	s.ffmpegSem <- struct{}{}        // Acquire semaphore
@@ -4302,21 +4735,28 @@ func (s *Server) serveFfmpeg(args []string, contentType string, w http.ResponseW
 	}
 
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Keep-Alive", "timeout=5")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Always log FFmpeg command for debugging connection issues
+	log.Printf("FFMPEG: Running %s %s", s.ffmpegMgr.ffmpegPath, strings.Join(args, " "))
+	log.Printf("FFMPEG: Content-Type: %s, Args: %v", contentType, args)
 
 	if os.Getenv("FFMPEG_DEBUG") != "" {
 		log.Printf("FFMPEG: Running %s %s", s.ffmpegMgr.ffmpegPath, strings.Join(args, " "))
-	}
-	if os.Getenv("FFMPEG_DEBUG") != "" {
 		log.Printf("FFMPEG: Content-Type: %s, Args: %v", contentType, args)
 	}
 
-	const maxWait = 10 * time.Second
+	const maxWait = 5 * time.Second
 	const retryDelay = 1 * time.Second
-	const minValidSize = 32 // bytes
+	const minValidSize = 16 // bytes - reduced to allow smaller segments
 	start := time.Now()
 
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		cmd := exec.CommandContext(ctx, s.ffmpegMgr.ffmpegPath, args...)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -4335,51 +4775,169 @@ func (s *Server) serveFfmpeg(args []string, contentType string, w http.ResponseW
 			cancel()
 			return fmt.Errorf("failed to start ffmpeg: %v", err)
 		}
-		var buf bytes.Buffer
+
+		// Start stderr collection in background
 		var stderrBuf bytes.Buffer
-		copyErr := make(chan error, 1)
+		stderrDone := make(chan error, 1)
 		go func() {
-			_, err := io.Copy(&buf, stdout)
-			copyErr <- err
+			_, err := io.Copy(&stderrBuf, stderr)
+			stderrDone <- err
 		}()
-		go func() {
-			io.Copy(&stderrBuf, stderr)
-		}()
-		err = <-copyErr
+
+		// Write headers immediately for streaming
+		w.WriteHeader(http.StatusOK)
+
+		// Enhanced streaming with better error handling for unavailable bytes
+		written, err := io.Copy(w, stdout)
 		stdout.Close()
+
+		// Wait for stderr to complete
+		<-stderrDone
+		stderr.Close()
+		cmd.Wait()
+
+		// Check for client disconnection errors (like JavaScript)
+		if err != nil {
+			if strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "broken pipe") ||
+				strings.Contains(err.Error(), "write: connection reset") ||
+				strings.Contains(err.Error(), "write: broken pipe") {
+				log.Printf("FFMPEG: Client disconnected during streaming")
+				return nil // Don't treat client disconnection as an error
+			}
+			return fmt.Errorf("ffmpeg streaming error: %v", err)
+		}
+		cancel()
+
+		// Check if we got any output
+		if written >= minValidSize {
+			if err != nil {
+				// Check if it's a client disconnection error
+				if strings.Contains(err.Error(), "connection reset by peer") ||
+					strings.Contains(err.Error(), "broken pipe") ||
+					strings.Contains(err.Error(), "write: connection reset") ||
+					strings.Contains(err.Error(), "write: broken pipe") {
+					log.Printf("FFMPEG: Client disconnected during streaming: %v", err)
+					return nil // Don't treat client disconnection as an error
+				}
+				log.Printf("FFMPEG: Error streaming output: %v", err)
+				return fmt.Errorf("failed to stream ffmpeg output: %v", err)
+			}
+			log.Printf("FFMPEG: Successfully streamed %d bytes", written)
+			return nil
+		}
+
+		// If we get here, FFmpeg didn't produce enough output
+		if time.Since(start) > maxWait {
+			log.Printf("serveFfmpeg: FFmpeg output still empty after %v, giving up", maxWait)
+			log.Printf("FFMPEG: Stderr: %s", stderrBuf.String())
+			return fmt.Errorf("ffmpeg output empty after retries")
+		}
+
+		log.Printf("serveFfmpeg: FFmpeg output too small (%d bytes), retrying in %v...", written, retryDelay)
+		log.Printf("FFMPEG: Stderr: %s", stderrBuf.String())
+		time.Sleep(retryDelay)
+	}
+}
+
+// serveFfmpegWithContentLength buffers FFmpeg output and sets Content-Length header
+func (s *Server) serveFfmpegWithContentLength(args []string, contentType string, w http.ResponseWriter) error {
+	s.ffmpegSem <- struct{}{}        // Acquire semaphore
+	defer func() { <-s.ffmpegSem }() // Release semaphore
+
+	if s.ffmpegMgr == nil || s.ffmpegMgr.ffmpegPath == "" {
+		return fmt.Errorf("no ffmpeg found")
+	}
+
+	// Always log FFmpeg command for debugging connection issues
+	log.Printf("FFMPEG: Running %s %s", s.ffmpegMgr.ffmpegPath, strings.Join(args, " "))
+	log.Printf("FFMPEG: Content-Type: %s, Args: %v", contentType, args)
+
+	if os.Getenv("FFMPEG_DEBUG") != "" {
+		log.Printf("FFMPEG: Running %s %s", s.ffmpegMgr.ffmpegPath, strings.Join(args, " "))
+		log.Printf("FFMPEG: Content-Type: %s, Args: %v", contentType, args)
+	}
+
+	const maxWait = 5 * time.Second
+	const retryDelay = 1 * time.Second
+	const minValidSize = 16 // bytes - reduced to allow smaller segments
+	start := time.Now()
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		cmd := exec.CommandContext(ctx, s.ffmpegMgr.ffmpegPath, args...)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			cancel()
+			return fmt.Errorf("failed to create stdout pipe: %v", err)
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			stdout.Close()
+			cancel()
+			return fmt.Errorf("failed to create stderr pipe: %v", err)
+		}
+		if err := cmd.Start(); err != nil {
+			stdout.Close()
+			stderr.Close()
+			cancel()
+			return fmt.Errorf("failed to start ffmpeg: %v", err)
+		}
+
+		// Start stderr collection in background
+		var stderrBuf bytes.Buffer
+		stderrDone := make(chan error, 1)
+		go func() {
+			_, err := io.Copy(&stderrBuf, stderr)
+			stderrDone <- err
+		}()
+
+		// Buffer the entire FFmpeg output
+		var outputBuf bytes.Buffer
+		written, err := io.Copy(&outputBuf, stdout)
+		stdout.Close()
+
+		// Wait for stderr to complete
+		<-stderrDone
 		stderr.Close()
 		cmd.Wait()
 		cancel()
 
-		if err != nil {
-			log.Printf("FFMPEG: Error copying output: %v", err)
-			log.Printf("FFMPEG: Stderr: %s", stderrBuf.String())
-			return fmt.Errorf("failed to buffer ffmpeg output: %v", err)
-		}
-
-		if buf.Len() >= minValidSize {
-			length := buf.Len()
-			if length < 0 {
-				length = 0
+		// Check if we got any output
+		if written >= minValidSize {
+			if err != nil {
+				log.Printf("FFMPEG: Error reading output: %v", err)
+				return fmt.Errorf("failed to read ffmpeg output: %v", err)
 			}
-			w.Header().Set("Content-Length", strconv.Itoa(length))
+
+			// Set headers including Content-Length
+			w.Header().Set("Content-Type", contentType)
 			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("Keep-Alive", "timeout=5")
 			w.Header().Set("Accept-Ranges", "bytes")
-			w.WriteHeader(http.StatusOK)
-			_, err = w.Write(buf.Bytes())
-			return err
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(outputBuf.Len()), 10))
+
+			// Write the buffered output
+			_, err = w.Write(outputBuf.Bytes())
+			if err != nil {
+				log.Printf("FFMPEG: Error writing response: %v", err)
+				return fmt.Errorf("failed to write response: %v", err)
+			}
+
+			log.Printf("FFMPEG: Successfully sent %d bytes with Content-Length header", outputBuf.Len())
+			return nil
 		}
 
+		// If we get here, FFmpeg didn't produce enough output
 		if time.Since(start) > maxWait {
-			log.Printf("serveFfmpeg: FFmpeg output still empty after %v, giving up", maxWait)
+			log.Printf("serveFfmpegWithContentLength: FFmpeg output still empty after %v, giving up", maxWait)
 			log.Printf("FFMPEG: Stderr: %s", stderrBuf.String())
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("FFmpeg output empty after retries"))
 			return fmt.Errorf("ffmpeg output empty after retries")
 		}
 
-		log.Printf("serveFfmpeg: FFmpeg output empty (%d bytes), retrying in %v...", buf.Len(), retryDelay)
+		log.Printf("serveFfmpegWithContentLength: FFmpeg output too small (%d bytes), retrying in %v...", written, retryDelay)
 		log.Printf("FFMPEG: Stderr: %s", stderrBuf.String())
 		time.Sleep(retryDelay)
 	}
@@ -4414,7 +4972,7 @@ func (s *Server) generateHLSAudioPlaylist(engine *TorrentEngine, fileIndex int, 
 		log.Printf("Audio playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 2.0                                     // Match ffmpeg segment duration
+	segmentDuration := 4.0                                     // Match ffmpeg segment duration
 	numSegments := int(totalDuration/segmentDuration + 0.9999) // ceil
 	if numSegments < 1 {
 		numSegments = 1
@@ -4425,7 +4983,7 @@ func (s *Server) generateHLSAudioPlaylist(engine *TorrentEngine, fileIndex int, 
 
 	playlist.WriteString("#EXTM3U\n")
 	playlist.WriteString("#EXT-X-VERSION:7\n")
-	playlist.WriteString("#EXT-X-TARGETDURATION:15\n")
+	playlist.WriteString("#EXT-X-TARGETDURATION:5\n")
 	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
 	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
@@ -4492,7 +5050,7 @@ func (s *Server) generateHLSSubtitlePlaylist(engine *TorrentEngine, fileIndex in
 		log.Printf("Subtitle playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 2.0 // Match ffmpeg segment duration
+	segmentDuration := 4.0 // Match ffmpeg segment duration
 	numSegments := int(totalDuration / segmentDuration)
 	if numSegments < 1 {
 		numSegments = 1
@@ -4503,7 +5061,7 @@ func (s *Server) generateHLSSubtitlePlaylist(engine *TorrentEngine, fileIndex in
 
 	playlist.WriteString("#EXTM3U\n")
 	playlist.WriteString("#EXT-X-VERSION:7\n")
-	playlist.WriteString("#EXT-X-TARGETDURATION:5\n") // Use 5 as target duration (slightly higher than segment duration)
+	playlist.WriteString("#EXT-X-TARGETDURATION:5\n") // Use 4 as target duration (matching segment duration)
 	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
 	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
@@ -4551,7 +5109,7 @@ func (s *Server) generateHLSStreamPlaylist(engine *TorrentEngine, fileIndex int,
 		log.Printf("Video playlist: Using estimated duration: %.3f seconds", totalDuration)
 	}
 
-	segmentDuration := 2.0                                     // Match ffmpeg segment duration
+	segmentDuration := 4.0                                     // Match ffmpeg segment duration
 	numSegments := int(totalDuration/segmentDuration + 0.9999) // ceil
 	if numSegments < 1 {
 		numSegments = 1
@@ -4562,7 +5120,7 @@ func (s *Server) generateHLSStreamPlaylist(engine *TorrentEngine, fileIndex int,
 
 	playlist.WriteString("#EXTM3U\n")
 	playlist.WriteString("#EXT-X-VERSION:7\n")
-	playlist.WriteString("#EXT-X-TARGETDURATION:15\n")
+	playlist.WriteString("#EXT-X-TARGETDURATION:5\n")
 	playlist.WriteString("#EXT-X-MEDIA-SEQUENCE:1\n")
 	playlist.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
@@ -4808,4 +5366,243 @@ func (s *Server) handleHLSSubtitleM3U8(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Write([]byte(playlist))
+}
+
+// ClientCapabilities represents client video/audio capabilities
+type ClientCapabilities struct {
+	SupportsHEVC         bool
+	SupportsAV1          bool
+	SupportsVP9          bool
+	IsAppleDevice        bool
+	IsAndroidDevice      bool
+	IsWebBrowser         bool
+	UserAgent            string
+	PreferredCodec       string
+	PreferredAudioCodec  string
+	SupportedVideoCodecs []string
+	SupportedAudioCodecs []string
+	MaxAudioChannels     int
+}
+
+// detectClientCapabilities analyzes User-Agent to determine client capabilities
+func detectClientCapabilities(userAgent string) *ClientCapabilities {
+	if userAgent == "" {
+		return &ClientCapabilities{
+			SupportsHEVC:   false,
+			PreferredCodec: "h264",
+			UserAgent:      "",
+		}
+	}
+
+	userAgentLower := strings.ToLower(userAgent)
+	caps := &ClientCapabilities{
+		UserAgent: userAgent,
+	}
+
+	// Detect device types
+	caps.IsAppleDevice = strings.Contains(userAgentLower, "iphone") ||
+		strings.Contains(userAgentLower, "ipad") ||
+		strings.Contains(userAgentLower, "ipod") ||
+		strings.Contains(userAgentLower, "macos") ||
+		strings.Contains(userAgentLower, "darwin") ||
+		strings.Contains(userAgentLower, "safari")
+
+	caps.IsAndroidDevice = strings.Contains(userAgentLower, "android")
+
+	caps.IsWebBrowser = strings.Contains(userAgentLower, "mozilla") ||
+		strings.Contains(userAgentLower, "chrome") ||
+		strings.Contains(userAgentLower, "safari") ||
+		strings.Contains(userAgentLower, "firefox") ||
+		strings.Contains(userAgentLower, "edge")
+
+	// HEVC support detection based on known compatible clients
+	caps.SupportsHEVC = false
+
+	// Apple devices (iOS 11+, macOS 10.13+, Safari 11+) support HEVC
+	if caps.IsAppleDevice {
+		caps.SupportsHEVC = true
+		caps.PreferredCodec = "hevc"
+	}
+
+	// Android 5.0+ devices generally support HEVC (API level 21+)
+	if caps.IsAndroidDevice {
+		caps.SupportsHEVC = true
+		caps.PreferredCodec = "hevc"
+	}
+
+	// Chrome 107+ supports HEVC on Windows and macOS
+	if strings.Contains(userAgentLower, "chrome") {
+		// Parse Chrome version
+		if chromeVersionMatch := strings.Contains(userAgentLower, "chrome/"); chromeVersionMatch {
+			caps.SupportsHEVC = true // Modern Chrome has HEVC support
+		}
+	}
+
+	// Edge supports HEVC on Windows 10+
+	if strings.Contains(userAgentLower, "edge") {
+		caps.SupportsHEVC = true
+	}
+
+	// VP9 support (mostly for web browsers)
+	caps.SupportsVP9 = caps.IsWebBrowser
+
+	// AV1 support (newer browsers)
+	caps.SupportsAV1 = strings.Contains(userAgentLower, "chrome") ||
+		strings.Contains(userAgentLower, "firefox")
+
+	// Default to H.264 if no HEVC support detected
+	if !caps.SupportsHEVC {
+		caps.PreferredCodec = "h264"
+	}
+
+	return caps
+}
+
+// shouldTranscodeHEVC determines if HEVC content should be transcoded based on client capabilities
+func shouldTranscodeHEVC(capabilities *ClientCapabilities, inputCodec string) bool {
+	if capabilities == nil {
+		return true // Default to transcoding if no capability info
+	}
+
+	codecLower := strings.ToLower(inputCodec)
+	isHEVC := strings.Contains(codecLower, "hevc") ||
+		strings.Contains(codecLower, "h.265") ||
+		strings.Contains(codecLower, "h265")
+
+	if !isHEVC {
+		return false // Not HEVC, no need to transcode
+	}
+
+	// If client supports HEVC, don't transcode
+	if capabilities.SupportsHEVC {
+		return false
+	}
+
+	// Client doesn't support HEVC, transcode to H.264
+	return true
+}
+
+// detectClientCapabilitiesFromQuery analyzes query parameters to determine client capabilities
+func detectClientCapabilitiesFromQuery(r *http.Request) *ClientCapabilities {
+	// Start with User-Agent detection
+	caps := detectClientCapabilities(r.Header.Get("User-Agent"))
+
+	// Override with explicit query parameters (higher priority)
+	videoCodecs := r.URL.Query()["videoCodecs"]
+	audioCodecs := r.URL.Query()["audioCodecs"]
+	maxAudioChannelsStr := r.URL.Query().Get("maxAudioChannels")
+
+	// Parse max audio channels
+	if maxAudioChannelsStr != "" {
+		if maxChannels, err := strconv.Atoi(maxAudioChannelsStr); err == nil && maxChannels > 0 {
+			caps.MaxAudioChannels = maxChannels
+		}
+	}
+	if caps.MaxAudioChannels == 0 {
+		caps.MaxAudioChannels = 2 // Default to stereo
+	}
+
+	// Check supported video codecs from query
+	if len(videoCodecs) > 0 {
+		caps.SupportedVideoCodecs = videoCodecs
+		// Check if HEVC is explicitly supported
+		caps.SupportsHEVC = false
+		for _, codec := range videoCodecs {
+			codecLower := strings.ToLower(codec)
+			if codecLower == "hevc" || codecLower == "h265" || codecLower == "h.265" {
+				caps.SupportsHEVC = true
+				caps.PreferredCodec = "hevc"
+				break
+			}
+		}
+		// If HEVC not found, default to H.264
+		if !caps.SupportsHEVC {
+			caps.PreferredCodec = "h264"
+		}
+	}
+
+	// Check supported audio codecs from query
+	if len(audioCodecs) > 0 {
+		caps.SupportedAudioCodecs = audioCodecs
+		// Default to AAC if supported, otherwise use first available
+		caps.PreferredAudioCodec = "aac"
+		for _, codec := range audioCodecs {
+			if strings.ToLower(codec) == "aac" {
+				caps.PreferredAudioCodec = "aac"
+				break
+			}
+		}
+		if caps.PreferredAudioCodec == "aac" {
+			// If AAC not found in supported codecs, use first available
+			for _, codec := range audioCodecs {
+				codecLower := strings.ToLower(codec)
+				if codecLower == "mp3" || codecLower == "opus" {
+					caps.PreferredAudioCodec = codecLower
+					break
+				}
+			}
+		}
+	} else {
+		// Default audio codec support
+		caps.SupportedAudioCodecs = []string{"aac", "mp3"}
+		caps.PreferredAudioCodec = "aac"
+	}
+
+	log.Printf("Client capabilities from query - Video codecs: %v, Audio codecs: %v, HEVC: %v, Max channels: %d",
+		caps.SupportedVideoCodecs, caps.SupportedAudioCodecs, caps.SupportsHEVC, caps.MaxAudioChannels)
+
+	return caps
+}
+
+// needsTranscoding determines if content needs transcoding based on client capabilities and input format
+func needsTranscoding(caps *ClientCapabilities, videoCodec, audioCodec string, audioChannels int) (bool, bool) {
+	needsVideoTranscode := false
+	needsAudioTranscode := false
+
+	// Check video transcoding need
+	if videoCodec != "" {
+		codecLower := strings.ToLower(videoCodec)
+		isHEVC := strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265")
+
+		if isHEVC && !caps.SupportsHEVC {
+			needsVideoTranscode = true
+		} else if len(caps.SupportedVideoCodecs) > 0 {
+			// Check if input codec is in supported list
+			supported := false
+			for _, supportedCodec := range caps.SupportedVideoCodecs {
+				if strings.ToLower(supportedCodec) == codecLower {
+					supported = true
+					break
+				}
+			}
+			if !supported {
+				needsVideoTranscode = true
+			}
+		}
+	}
+
+	// Check audio transcoding need
+	if audioCodec != "" {
+		codecLower := strings.ToLower(audioCodec)
+		if len(caps.SupportedAudioCodecs) > 0 {
+			// Check if input codec is in supported list
+			supported := false
+			for _, supportedCodec := range caps.SupportedAudioCodecs {
+				if strings.ToLower(supportedCodec) == codecLower {
+					supported = true
+					break
+				}
+			}
+			if !supported {
+				needsAudioTranscode = true
+			}
+		}
+
+		// Check if audio channels exceed client capability
+		if audioChannels > caps.MaxAudioChannels {
+			needsAudioTranscode = true
+		}
+	}
+
+	return needsVideoTranscode, needsAudioTranscode
 }

@@ -158,7 +158,7 @@ type ProbeStream struct {
 func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 	ffmpegPath, err := findFFmpeg()
 	if err != nil {
-		log.Printf("Warning: FFmpeg not found: %v", err)
+		log.Printf("[NewFFmpegManager] Warning: FFmpeg not found: %v", err)
 		// Return a manager with empty paths - server can still run without FFmpeg
 		return &FFmpegManager{
 			ffmpegPath:  "",
@@ -170,7 +170,7 @@ func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 
 	ffprobePath, err := findFFprobe()
 	if err != nil {
-		log.Printf("Warning: FFprobe not found: %v", err)
+		log.Printf("[NewFFmpegManager] Warning: FFprobe not found: %v", err)
 		// Return a manager with just ffmpeg - some operations will still work
 		return &FFmpegManager{
 			ffmpegPath:  ffmpegPath,
@@ -189,11 +189,11 @@ func NewFFmpegManager(config *FFmpegConfig) (*FFmpegManager, error) {
 
 	// Test FFmpeg installation (but don't fail if it doesn't work)
 	if err := manager.testInstallation(); err != nil {
-		log.Printf("Warning: FFmpeg test failed: %v", err)
+		log.Printf("[NewFFmpegManager] Warning: FFmpeg test failed: %v", err)
 		// Still return the manager - server can run without working FFmpeg
 	}
 
-	log.Printf("FFmpeg initialized: %s, FFprobe: %s", ffmpegPath, ffprobePath)
+	log.Printf("[NewFFmpegManager] FFmpeg initialized: %s, FFprobe: %s", ffmpegPath, ffprobePath)
 	return manager, nil
 }
 
@@ -323,7 +323,7 @@ func (fm *FFmpegManager) TranscodeVideo(inputPath, outputPath string, options Tr
 	args := fm.buildTranscodeArgs(inputPath, outputPath, options)
 
 	if fm.config.Debug {
-		log.Printf("FFmpeg command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[TranscodeVideo] FFmpeg command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -370,7 +370,7 @@ func (fm *FFmpegManager) TranscodeVideoToHLS(inputPath, outputDir, playlistName 
 	}
 
 	if fm.config.Debug {
-		log.Printf("FFmpeg HLS command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[TranscodeVideoToHLS] FFmpeg HLS command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -384,7 +384,7 @@ func (fm *FFmpegManager) StreamTranscode(inputPath string, w http.ResponseWriter
 	args := fm.buildStreamArgs(inputPath, options)
 
 	if fm.config.Debug {
-		log.Printf("FFmpeg stream command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[StreamTranscode] FFmpeg stream command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -421,7 +421,7 @@ func (fm *FFmpegManager) StreamTranscode(inputPath string, w http.ResponseWriter
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				log.Printf("FFmpeg: %s", scanner.Text())
+				log.Printf("[StreamTranscode] FFmpeg: %s", scanner.Text())
 			}
 		}()
 	}
@@ -441,7 +441,7 @@ func (fm *FFmpegManager) GenerateThumbnail(inputPath, outputPath string, timeOff
 	}
 
 	if fm.config.Debug {
-		log.Printf("FFmpeg thumbnail command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[GenerateThumbnail] FFmpeg thumbnail command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -455,48 +455,23 @@ func (fm *FFmpegManager) GetHardwareAccelerationInfo() map[string]interface{} {
 	info := make(map[string]interface{})
 	var profiles []string
 
-	// Test VAAPI (matching Node.js behavior)
-	if fm.testHardwareAccel("vaapi") {
-		info["vaapi"] = map[string]interface{}{
-			"available": true,
-			"device":    "/dev/dri/renderD128",
-		}
-		profiles = append(profiles, "vaapi-renderD128")
-	}
+	// Get hardware profiles with codec mappings
+	hardwareProfiles := fm.GetHardwareProfiles()
 
-	// Test CUDA (matching Node.js behavior)
-	if fm.testHardwareAccel("cuda") {
-		info["cuda"] = map[string]interface{}{
-			"available": true,
-			"device":    "0",
+	for profileName, profile := range hardwareProfiles {
+		if profile.Available {
+			info[profileName] = map[string]interface{}{
+				"available":     true,
+				"displayName":   profile.DisplayName,
+				"platform":      profile.Platform,
+				"videoEncoders": profile.VideoEncoders,
+				"videoDecoders": profile.VideoDecoders,
+				"audioEncoders": profile.AudioEncoders,
+				"audioDecoders": profile.AudioDecoders,
+				"supportsHEVC":  profile.VideoEncoders["hevc"] != "",
+			}
+			profiles = append(profiles, profileName)
 		}
-		profiles = append(profiles, "cuda")
-	}
-
-	// Test VideoToolbox (macOS)
-	if fm.testHardwareAccel("videotoolbox") {
-		info["videotoolbox"] = map[string]interface{}{
-			"available": true,
-		}
-		profiles = append(profiles, "videotoolbox")
-	}
-
-	// Test Intel Quick Sync (matching Node.js behavior)
-	if fm.testHardwareAccel("qsv") {
-		info["qsv"] = map[string]interface{}{
-			"available": true,
-			"device":    "/dev/dri/renderD128",
-		}
-		profiles = append(profiles, "qsv")
-	}
-
-	// Test NVIDIA NVENC (matching Node.js behavior)
-	if fm.testHardwareAccel("nvenc") {
-		info["nvenc"] = map[string]interface{}{
-			"available": true,
-			"device":    "0",
-		}
-		profiles = append(profiles, "nvenc")
 	}
 
 	// Add profiles array (matching Node.js behavior)
@@ -507,6 +482,13 @@ func (fm *FFmpegManager) GetHardwareAccelerationInfo() map[string]interface{} {
 		info["defaultProfile"] = "software"
 	} else {
 		info["defaultProfile"] = profiles[0]
+	}
+
+	// Add codec support summary
+	info["codecSupport"] = map[string]interface{}{
+		"hevc":             len(profiles) > 0,
+		"h264":             len(profiles) > 0,
+		"hardwareProfiles": len(profiles),
 	}
 
 	return info
@@ -653,7 +635,7 @@ func (fm *FFmpegManager) ExtractAudio(inputPath, outputPath string, format strin
 	}
 
 	if fm.config.Debug {
-		log.Printf("FFmpeg audio extraction command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[ExtractAudio] FFmpeg audio extraction command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -769,14 +751,14 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 
 	// Check if ffprobe is available
 	if fm.ffprobePath == "" {
-		log.Printf("FFprobe not available, using fallback for %s", inputPath)
+		log.Printf("[GetProbeInfoWithTimeout] FFprobe not available, using fallback for %s", inputPath)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 
 	// Check if input file exists
 	stat, err := os.Stat(inputPath)
 	if err != nil {
-		log.Printf("Input file does not exist: %s, error: %v", inputPath, err)
+		log.Printf("[GetProbeInfoWithTimeout] Input file does not exist: %s, error: %v", inputPath, err)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 	fileSize := stat.Size()
@@ -786,7 +768,7 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 	cacheEntry, ok := fm.probeCache[inputPath]
 	if ok && cacheEntry.FileSize == fileSize && time.Since(cacheEntry.Time) < 10*time.Minute {
 		fm.probeCacheMu.Unlock()
-		log.Printf("FFprobe cache hit for %s (size=%d)", inputPath, fileSize)
+		log.Printf("[GetProbeInfoWithTimeout] FFprobe cache hit for %s (size=%d)", inputPath, fileSize)
 		return cacheEntry.Result, cacheEntry.Err
 	}
 	fm.probeCacheMu.Unlock()
@@ -804,22 +786,22 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 	output, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			log.Printf("FFprobe timeout after %v for %s", timeout, inputPath)
+			log.Printf("[GetProbeInfoWithTimeout] FFprobe timeout after %v for %s", timeout, inputPath)
 			return nil, fmt.Errorf("ffprobe timeout after %v", timeout)
 		}
-		log.Printf("FFprobe failed for %s: %v, attempting fallback", inputPath, err)
+		log.Printf("[GetProbeInfoWithTimeout] FFprobe failed for %s: %v, attempting fallback", inputPath, err)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 
 	// Parse the raw JSON output
 	var rawData map[string]interface{}
 	if err := json.Unmarshal(output, &rawData); err != nil {
-		log.Printf("Failed to parse ffprobe output for %s: %v, attempting fallback", inputPath, err)
+		log.Printf("[GetProbeInfoWithTimeout] Failed to parse ffprobe output for %s: %v, attempting fallback", inputPath, err)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 
 	if len(rawData) == 0 {
-		log.Printf("FFprobe returned empty data for %s, attempting fallback", inputPath)
+		log.Printf("[GetProbeInfoWithTimeout] FFprobe returned empty data for %s, attempting fallback", inputPath)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 
@@ -876,12 +858,12 @@ func (fm *FFmpegManager) GetProbeInfoWithTimeout(inputPath string, timeout time.
 	}
 
 	if response.Format.Duration == 0 && len(response.Streams) == 0 {
-		log.Printf("No meaningful data extracted from ffprobe for %s, using fallback", inputPath)
+		log.Printf("[GetProbeInfoWithTimeout] No meaningful data extracted from ffprobe for %s, using fallback", inputPath)
 		return fm.getFallbackProbeInfo(inputPath)
 	}
 
 	// Log a concise summary
-	log.Printf("FFprobe: %s size=%d duration=%.2fs streams=%d [video=%d audio=%d subtitle=%d] format=%s", inputPath, fileSize, response.Format.Duration, len(response.Streams), streamTypes["video"], streamTypes["audio"], streamTypes["subtitle"], response.Format.Name)
+	log.Printf("[GetProbeInfoWithTimeout] FFprobe: %s size=%d duration=%.2fs streams=%d [video=%d audio=%d subtitle=%d] format=%s", inputPath, fileSize, response.Format.Duration, len(response.Streams), streamTypes["video"], streamTypes["audio"], streamTypes["subtitle"], response.Format.Name)
 
 	// Store in cache
 	fm.probeCacheMu.Lock()
@@ -1347,13 +1329,34 @@ func (fm *FFmpegManager) IsAvailable() bool {
 
 // RemuxStream remuxes a video, copying video/audio and including a single subtitle track
 func (fm *FFmpegManager) RemuxStream(inputPath string, w http.ResponseWriter, r *http.Request, subtitleTrack int) error {
+	// Check if input is HEVC and handle accordingly
+	isHEVC := false
+	if fm.IsProbeAvailable() {
+		probeInfo, err := fm.GetProbeInfo(inputPath)
+		if err == nil && probeInfo != nil {
+			for _, stream := range probeInfo.Streams {
+				if stream.Track == "video" {
+					codecLower := strings.ToLower(stream.Codec)
+					if strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265") {
+						isHEVC = true
+						break
+					}
+				}
+			}
+		}
+	}
+
 	args := []string{
 		"-i", inputPath,
-		"-c:v", "copy",
-		"-c:a", "copy",
-		"-map", "0:v:0",
-		"-map", "0:a:0",
 	}
+
+	if isHEVC {
+		args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18")
+	} else {
+		args = append(args, "-c:v", "copy")
+	}
+
+	args = append(args, "-c:a", "copy", "-map", "0:v:0", "-map", "0:a:0")
 
 	if subtitleTrack >= 0 {
 		args = append(args, "-map", fmt.Sprintf("0:s:%d", subtitleTrack), "-c:s", "mov_text")
@@ -1362,7 +1365,7 @@ func (fm *FFmpegManager) RemuxStream(inputPath string, w http.ResponseWriter, r 
 	args = append(args, "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "-")
 
 	if fm.config.Debug {
-		log.Printf("FFmpeg remux command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[RemuxStream] FFmpeg remux command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -1405,7 +1408,7 @@ func (fm *FFmpegManager) RemuxStream(inputPath string, w http.ResponseWriter, r 
 // RunFFmpeg executes a custom FFmpeg command with the given arguments
 func (fm *FFmpegManager) RunFFmpeg(args []string) error {
 	if fm.config.Debug {
-		log.Printf("FFmpeg custom command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
+		log.Printf("[RunFFmpeg] FFmpeg custom command: %s %s", fm.ffmpegPath, strings.Join(args, " "))
 	}
 
 	cmd := exec.Command(fm.ffmpegPath, args...)
@@ -1427,4 +1430,177 @@ func (fm *FFmpegManager) GetFFmpegPath() string {
 // GetFFprobePath returns the FFprobe executable path
 func (fm *FFmpegManager) GetFFprobePath() string {
 	return fm.ffprobePath
+}
+
+// HardwareProfile represents a hardware acceleration profile with codec mappings
+type HardwareProfile struct {
+	Name          string
+	DisplayName   string
+	Platform      string
+	VideoEncoders map[string]string // codec -> encoder mapping
+	VideoDecoders map[string]string // codec -> decoder mapping
+	AudioEncoders map[string]string
+	AudioDecoders map[string]string
+	InputArgs     []string
+	Available     bool
+}
+
+// GetHardwareProfiles returns available hardware acceleration profiles (matching Node.js server.js)
+func (fm *FFmpegManager) GetHardwareProfiles() map[string]*HardwareProfile {
+	profiles := make(map[string]*HardwareProfile)
+
+	// VAAPI Profile (Linux Intel/AMD)
+	vaapiProfile := &HardwareProfile{
+		Name:        "vaapi-renderD128",
+		DisplayName: "VAAPI (Intel/AMD)",
+		Platform:    "linux",
+		VideoEncoders: map[string]string{
+			"libx264": "h264_vaapi",
+			"hevc":    "hevc_vaapi",
+			"h264":    "h264_vaapi",
+			"h265":    "hevc_vaapi",
+		},
+		VideoDecoders: map[string]string{
+			"h264": "h264",
+			"hevc": "hevc",
+			"h265": "hevc",
+		},
+		AudioEncoders: map[string]string{
+			"aac": "aac",
+		},
+		AudioDecoders: map[string]string{
+			"aac": "aac",
+			"ac3": "ac3",
+		},
+		InputArgs: []string{"-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128"},
+		Available: fm.testHardwareAccel("vaapi"),
+	}
+	profiles["vaapi-renderD128"] = vaapiProfile
+
+	// NVIDIA NVENC Profile
+	nvencProfile := &HardwareProfile{
+		Name:        "nvenc",
+		DisplayName: "NVIDIA NVENC",
+		Platform:    "all",
+		VideoEncoders: map[string]string{
+			"libx264": "h264_nvenc",
+			"hevc":    "hevc_nvenc",
+			"h264":    "h264_nvenc",
+			"h265":    "hevc_nvenc",
+		},
+		VideoDecoders: map[string]string{
+			"h264": "h264_cuvid",
+			"hevc": "hevc_cuvid",
+			"h265": "hevc_cuvid",
+		},
+		AudioEncoders: map[string]string{
+			"aac": "aac",
+		},
+		AudioDecoders: map[string]string{
+			"aac": "aac",
+			"ac3": "ac3",
+		},
+		InputArgs: []string{"-hwaccel", "cuda", "-hwaccel_device", "0"},
+		Available: fm.testHardwareAccel("cuda"),
+	}
+	profiles["nvenc"] = nvencProfile
+
+	// VideoToolbox Profile (macOS)
+	videotoolboxProfile := &HardwareProfile{
+		Name:        "videotoolbox",
+		DisplayName: "VideoToolbox (macOS)",
+		Platform:    "darwin",
+		VideoEncoders: map[string]string{
+			"libx264": "h264_videotoolbox",
+			"hevc":    "hevc_videotoolbox",
+			"h264":    "h264_videotoolbox",
+			"h265":    "hevc_videotoolbox",
+		},
+		VideoDecoders: map[string]string{
+			"h264": "h264",
+			"hevc": "hevc",
+			"h265": "hevc",
+		},
+		AudioEncoders: map[string]string{
+			"aac": "aac",
+		},
+		AudioDecoders: map[string]string{
+			"aac": "aac",
+			"ac3": "ac3",
+		},
+		InputArgs: []string{"-hwaccel", "videotoolbox"},
+		Available: fm.testHardwareAccel("videotoolbox"),
+	}
+	profiles["videotoolbox"] = videotoolboxProfile
+
+	// Intel Quick Sync Profile
+	qsvProfile := &HardwareProfile{
+		Name:        "qsv",
+		DisplayName: "Intel Quick Sync",
+		Platform:    "all",
+		VideoEncoders: map[string]string{
+			"libx264": "h264_qsv",
+			"hevc":    "hevc_qsv",
+			"h264":    "h264_qsv",
+			"h265":    "hevc_qsv",
+		},
+		VideoDecoders: map[string]string{
+			"h264": "h264_qsv",
+			"hevc": "hevc_qsv",
+			"h265": "hevc_qsv",
+		},
+		AudioEncoders: map[string]string{
+			"aac": "aac",
+		},
+		AudioDecoders: map[string]string{
+			"aac": "aac",
+			"ac3": "ac3",
+		},
+		InputArgs: []string{"-hwaccel", "qsv", "-hwaccel_device", "/dev/dri/renderD128"},
+		Available: fm.testHardwareAccel("qsv"),
+	}
+	profiles["qsv"] = qsvProfile
+
+	return profiles
+}
+
+// GetOptimalEncoder selects the best encoder for a given codec and client capabilities
+func (fm *FFmpegManager) GetOptimalEncoder(inputCodec string, capabilities *ClientCapabilities, preferHardware bool) (string, []string) {
+	profiles := fm.GetHardwareProfiles()
+
+	// If client supports HEVC and input is HEVC, try to use HEVC encoder
+	codecLower := strings.ToLower(inputCodec)
+	isInputHEVC := strings.Contains(codecLower, "hevc") || strings.Contains(codecLower, "h.265") || strings.Contains(codecLower, "h265")
+
+	// Determine target codec based on client capabilities
+	var targetCodec string
+	if isInputHEVC && capabilities != nil && capabilities.SupportsHEVC {
+		targetCodec = "hevc"
+	} else {
+		targetCodec = "h264" // Default fallback
+	}
+
+	// If hardware acceleration is preferred and available
+	if preferHardware && fm.config.HardwareAcceleration {
+		// Try profiles in order of preference
+		profileOrder := []string{"videotoolbox", "nvenc", "vaapi-renderD128", "qsv"}
+
+		for _, profileName := range profileOrder {
+			if profile, exists := profiles[profileName]; exists && profile.Available {
+				if encoder, hasEncoder := profile.VideoEncoders[targetCodec]; hasEncoder {
+					log.Printf("GetOptimalEncoder: Using hardware encoder %s for %s (profile: %s)", encoder, targetCodec, profileName)
+					return encoder, profile.InputArgs
+				}
+			}
+		}
+	}
+
+	// Fallback to software encoding
+	if targetCodec == "hevc" {
+		log.Printf("GetOptimalEncoder: Using software encoder libx265 for HEVC")
+		return "libx265", []string{}
+	} else {
+		log.Printf("GetOptimalEncoder: Using software encoder libx264 for H.264")
+		return "libx264", []string{}
+	}
 }
